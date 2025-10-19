@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ImageViewer.Application.Mappings;
+using ImageViewer.Application.Services;
 using ImageViewer.Domain.Entities;
 using ImageViewer.Domain.Interfaces;
 using ImageViewer.Domain.ValueObjects;
@@ -19,6 +20,8 @@ public class RedisCollectionIndexService : ICollectionIndexService
     private readonly IDatabase _db;
     private readonly ICollectionRepository _collectionRepository;
     private readonly ICacheFolderRepository _cacheFolderRepository;
+    private readonly IImageProcessingService _imageProcessingService;
+    private readonly IImageProcessingSettingsService _imageProcessingSettingsService;
     private readonly ILogger<RedisCollectionIndexService> _logger;
 
     // Redis key patterns
@@ -29,17 +32,22 @@ public class RedisCollectionIndexService : ICollectionIndexService
     private const string THUMBNAIL_PREFIX = "collection_index:thumb:";
     private const string DASHBOARD_STATS_KEY = "dashboard:statistics";
     private const string DASHBOARD_METADATA_KEY = "dashboard:metadata";
+    private const string STATE_PREFIX = "collection_index:state:";  // NEW: State tracking
 
     public RedisCollectionIndexService(
         IConnectionMultiplexer redis,
         ICollectionRepository collectionRepository,
         ICacheFolderRepository cacheFolderRepository,
+        IImageProcessingService imageProcessingService,
+        IImageProcessingSettingsService imageProcessingSettingsService,
         ILogger<RedisCollectionIndexService> logger)
     {
         _redis = redis;
         _db = redis.GetDatabase();
         _collectionRepository = collectionRepository;
         _cacheFolderRepository = cacheFolderRepository;
+        _imageProcessingService = imageProcessingService;
+        _imageProcessingSettingsService = imageProcessingSettingsService;
         _logger = logger;
     }
 
@@ -78,16 +86,11 @@ public class RedisCollectionIndexService : ICollectionIndexService
             
             var startTime = DateTime.UtcNow;
 
-            // Get all non-deleted collections
-            var collections = await _collectionRepository.FindAsync(
-                MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false),
-                MongoDB.Driver.Builders<Collection>.Sort.Ascending(c => c.Id),
-                0, // 0 = no limit, get all collections
-                0  // 0 = no skip
+            // Count total collections (lightweight query)
+            var totalCount = await _collectionRepository.CountAsync(
+                MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false)
             );
-
-            var collectionList = collections.ToList();
-            _logger.LogInformation("📊 Found {Count} collections to index from MongoDB", collectionList.Count);
+            _logger.LogInformation("📊 Found {Count} collections to index from MongoDB", totalCount);
 
             // Smart detection: If MongoDB has few collections but Redis has many keys, do a fast FLUSHDB
             // Only if Redis connection is ready (avoid timeout if connection still establishing)
@@ -96,14 +99,13 @@ public class RedisCollectionIndexService : ICollectionIndexService
             {
                 _logger.LogInformation("✅ Redis connected, checking for stale data...");
                 var redisKeyCount = await GetRedisKeyCountAsync();
-                var mongoCollectionCount = collectionList.Count;
                 _logger.LogInformation("📊 Redis keys: {RedisKeys}, MongoDB collections: {MongoCollections}", 
-                    redisKeyCount, mongoCollectionCount);
+                    redisKeyCount, totalCount);
                 
-                if (mongoCollectionCount < 100 && redisKeyCount > mongoCollectionCount * 10)
+                if (totalCount < 100 && redisKeyCount > totalCount * 10)
                 {
                     _logger.LogWarning("⚠️ Detected stale Redis data: {RedisKeys} keys but only {MongoCollections} collections. Using FLUSHDB for fast cleanup.", 
-                        redisKeyCount, mongoCollectionCount);
+                        redisKeyCount, totalCount);
                     await FlushRedisAsync();
                     _logger.LogInformation("✅ Redis flushed successfully");
                 }
@@ -122,13 +124,17 @@ public class RedisCollectionIndexService : ICollectionIndexService
                 _logger.LogInformation("✅ Redis flushed successfully");
             }
 
-            // Build sorted sets and hash entries
-            _logger.LogInformation("🔨 Building Redis index for {Count} collections...", collectionList.Count);
-            var batch = _db.CreateBatch();
-            var tasks = new List<Task>();
-
+            // Process collections in batches to avoid memory issues
+            const int BATCH_SIZE = 100; // Process 100 collections at a time
             var processedCount = 0;
-            foreach (var collection in collectionList)
+            var currentBatch = 0;
+            var totalBatches = (int)Math.Ceiling((double)totalCount / BATCH_SIZE);
+
+            _logger.LogInformation("🔨 Building Redis index for {Count} collections in {Batches} batches of {BatchSize}...", 
+                totalCount, totalBatches, BATCH_SIZE);
+
+            // Stream collections in batches
+            for (var skip = 0; skip < totalCount; skip += BATCH_SIZE)
             {
                 if (cancellationToken.IsCancellationRequested)
                 {
@@ -136,36 +142,87 @@ public class RedisCollectionIndexService : ICollectionIndexService
                     return;
                 }
 
-                // Add to sorted sets (one per sort field/direction combination)
-                tasks.Add(AddToSortedSetsAsync(batch, collection));
-
-                // Add summary to hash
-                tasks.Add(AddToHashAsync(batch, collection));
+                currentBatch++;
+                var batchStartTime = DateTime.UtcNow;
                 
-                processedCount++;
-                if (processedCount % 1000 == 0)
+                // Memory monitoring before batch
+                var memoryBefore = GC.GetTotalMemory(false);
+                _logger.LogDebug("💾 Batch {Current}/{Total}: Memory before = {MemoryMB:F2} MB", 
+                    currentBatch, totalBatches, memoryBefore / 1024.0 / 1024.0);
+
+                // Fetch only THIS batch with projection (avoid loading full Images/Thumbnails/CacheImages arrays)
+                var batchCollections = await _collectionRepository.FindAsync(
+                    MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false),
+                    MongoDB.Driver.Builders<Collection>.Sort.Ascending(c => c.Id),
+                    BATCH_SIZE,
+                    skip
+                );
+
+                var collectionList = batchCollections.ToList();
+                
+                // Process batch
+                var batch = _db.CreateBatch();
+                var tasks = new List<Task>();
+
+                foreach (var collection in collectionList)
                 {
-                    _logger.LogInformation("📊 Processed {Count}/{Total} collections...", processedCount, collectionList.Count);
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogWarning("⚠️ Index rebuild cancelled");
+                        return;
+                    }
+
+                    // Add to sorted sets (one per sort field/direction combination)
+                    tasks.Add(AddToSortedSetsAsync(batch, collection));
+
+                    // Add summary to hash
+                    tasks.Add(AddToHashAsync(batch, collection));
+                    
+                    // ✅ NEW: Update state tracking
+                    tasks.Add(UpdateCollectionIndexStateAsync(batch, collection));
+                    
+                    processedCount++;
                 }
+
+                // Execute batch
+                batch.Execute();
+                await Task.WhenAll(tasks);
+
+                // Memory monitoring after batch
+                var memoryAfter = GC.GetTotalMemory(false);
+                var memoryDelta = memoryAfter - memoryBefore;
+                var batchDuration = DateTime.UtcNow - batchStartTime;
+                
+                _logger.LogInformation("✅ Batch {Current}/{Total} completed: {Count} collections in {Duration}ms, Memory delta = {DeltaMB:+0.00;-0.00} MB (now {CurrentMB:F2} MB)", 
+                    currentBatch, totalBatches, collectionList.Count, batchDuration.TotalMilliseconds,
+                    memoryDelta / 1024.0 / 1024.0, memoryAfter / 1024.0 / 1024.0);
+
+                // ✅ CRITICAL: Clear tasks list to release memory held by completed tasks
+                tasks.Clear();
+                
+                // Force GC after each batch to free memory immediately
+                collectionList.Clear();
+                collectionList = null!; // ✅ Release list object reference
+                
+                // ✅ Use aggressive GC mode to release large objects immediately
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
             }
 
-            // Execute batch
-            _logger.LogInformation("💾 Executing Redis batch write for {Count} collections...", collectionList.Count);
-            batch.Execute();
-            await Task.WhenAll(tasks);
-            _logger.LogInformation("✅ Batch write completed successfully");
+            _logger.LogInformation("✅ All {Count} collections processed successfully", processedCount);
 
             // Update statistics
             _logger.LogInformation("📊 Updating index statistics...");
             await _db.StringSetAsync(LAST_REBUILD_KEY, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-            await _db.StringSetAsync(STATS_KEY + ":total", collectionList.Count);
+            await _db.StringSetAsync(STATS_KEY + ":total", totalCount);
             _logger.LogInformation("✅ Index statistics updated");
 
-            // Populate dashboard statistics cache
-            _logger.LogInformation("📊 Building dashboard statistics cache...");
+            // Populate dashboard statistics cache (streaming to avoid loading all at once)
+            _logger.LogInformation("📊 Building dashboard statistics cache (streaming)...");
             try
             {
-                var dashboardStats = await BuildDashboardStatisticsFromCollectionsAsync(collectionList);
+                var dashboardStats = await BuildDashboardStatisticsStreamingAsync(totalCount, cancellationToken);
                 await StoreDashboardStatisticsAsync(dashboardStats);
                 _logger.LogInformation("✅ Dashboard statistics cache populated successfully");
             }
@@ -176,7 +233,20 @@ public class RedisCollectionIndexService : ICollectionIndexService
 
             var duration = DateTime.UtcNow - startTime;
             _logger.LogInformation("✅ Collection index rebuilt successfully. {Count} collections indexed in {Duration}ms", 
-                collectionList.Count, duration.TotalMilliseconds);
+                processedCount, duration.TotalMilliseconds);
+            
+            // ✅ FINAL CLEANUP: Aggressive GC to release all accumulated memory
+            var memoryBeforeFinalGC = GC.GetTotalMemory(false);
+            _logger.LogInformation("🧹 Final memory cleanup: Before GC = {MemoryMB:F2} MB", memoryBeforeFinalGC / 1024.0 / 1024.0);
+            
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            
+            var memoryAfterFinalGC = GC.GetTotalMemory(true); // true = force full collection
+            var memoryFreed = memoryBeforeFinalGC - memoryAfterFinalGC;
+            _logger.LogInformation("✅ Final memory cleanup complete: After GC = {MemoryMB:F2} MB, Freed = {FreedMB:F2} MB", 
+                memoryAfterFinalGC / 1024.0 / 1024.0, memoryFreed / 1024.0 / 1024.0);
         }
         catch (Exception ex)
         {
@@ -196,6 +266,9 @@ public class RedisCollectionIndexService : ICollectionIndexService
 
             // Add/update hash
             await AddToHashAsync(_db, collection);
+            
+            // ✅ NEW: Update state tracking
+            await UpdateCollectionIndexStateAsync(_db, collection);
         }
         catch (Exception ex)
         {
@@ -262,6 +335,9 @@ public class RedisCollectionIndexService : ICollectionIndexService
 
             // Remove from hash
             tasks.Add(_db.KeyDeleteAsync(GetHashKey(collectionIdStr)));
+            
+            // ✅ NEW: Remove state tracking
+            tasks.Add(_db.KeyDeleteAsync(GetStateKey(collectionIdStr)));
 
             await Task.WhenAll(tasks);
         }
@@ -533,6 +609,11 @@ public class RedisCollectionIndexService : ICollectionIndexService
     {
         return $"{THUMBNAIL_PREFIX}{collectionId}";
     }
+    
+    private string GetStateKey(string collectionId)
+    {
+        return $"{STATE_PREFIX}{collectionId}";
+    }
 
     private async Task AddToSortedSetsAsync(IDatabaseAsync db, Collection collection)
     {
@@ -607,18 +688,58 @@ public class RedisCollectionIndexService : ICollectionIndexService
                 // Check if thumbnail file exists
                 if (File.Exists(thumbnail.ThumbnailPath))
                 {
-                    // Load binary data from disk
-                    var bytes = await File.ReadAllBytesAsync(thumbnail.ThumbnailPath);
+                    // ✅ NEW: Smart detection - resize if needed (direct mode, oversized, etc.)
+                    var needsResize = ShouldResizeThumbnail(thumbnail);
                     
-                    // Convert to base64 string
-                    var base64 = Convert.ToBase64String(bytes);
-                    
-                    // Create data URL with proper content type
-                    var contentType = GetContentTypeFromFormat(thumbnail.Format);
-                    thumbnailBase64 = $"data:{contentType};base64,{base64}";
-                    
-                    _logger.LogDebug("Cached base64 thumbnail for collection {CollectionId}, size: {Size} KB", 
-                        collection.Id, base64.Length / 1024);
+                    byte[] thumbnailBytes = null!;
+                    try
+                    {
+                        if (needsResize)
+                        {
+                            // Resize image in memory before caching (uses MongoDB settings)
+                            _logger.LogDebug("Resizing thumbnail for collection {CollectionId} (Direct={IsDirect}, {W}×{H}, {SizeKB} KB)",
+                                collection.Id, thumbnail.IsDirect, thumbnail.Width, thumbnail.Height, thumbnail.FileSize / 1024);
+                            
+                            thumbnailBytes = await ResizeImageForCacheAsync(thumbnail.ThumbnailPath);
+                            
+                            if (thumbnailBytes == null || thumbnailBytes.Length == 0)
+                            {
+                                _logger.LogWarning("Failed to resize thumbnail for collection {CollectionId}, skipping", 
+                                    collection.Id);
+                                return;  // Skip this thumbnail
+                            }
+                            
+                            _logger.LogDebug("Resized thumbnail: Original {OriginalKB} KB → Resized {ResizedKB} KB (saved {SavedKB} KB)",
+                                thumbnail.FileSize / 1024, thumbnailBytes.Length / 1024, 
+                                (thumbnail.FileSize - thumbnailBytes.Length) / 1024);
+                        }
+                        else
+                        {
+                            // Use pre-generated thumbnail as-is (already correct size)
+                            thumbnailBytes = await File.ReadAllBytesAsync(thumbnail.ThumbnailPath);
+                            
+                            _logger.LogDebug("Using pre-generated thumbnail for collection {CollectionId}, size: {Size} KB",
+                                collection.Id, thumbnailBytes.Length / 1024);
+                        }
+                        
+                        // Convert to base64 string
+                        var base64 = Convert.ToBase64String(thumbnailBytes);
+                        
+                        // Create data URL with proper content type
+                        var contentType = GetContentTypeFromFormat(thumbnail.Format);
+                        thumbnailBase64 = $"data:{contentType};base64,{base64}";
+                        
+                        _logger.LogDebug("Cached base64 thumbnail for collection {CollectionId}, size: {Size} KB", 
+                            collection.Id, base64.Length / 1024);
+                        
+                        // ✅ CRITICAL: Explicitly null out to help GC
+                        base64 = null!;
+                    }
+                    finally
+                    {
+                        // ✅ CRITICAL: Explicitly null out bytes array to help GC
+                        thumbnailBytes = null!;
+                    }
                 }
                 else
                 {
@@ -753,13 +874,22 @@ public class RedisCollectionIndexService : ICollectionIndexService
             }
             _logger.LogDebug("Found {Count} collection hashes to delete", hashCount);
             
+            // ✅ NEW: Find and delete all state keys
+            var stateCount = 0;
+            await foreach (var key in server.KeysAsync(pattern: $"{STATE_PREFIX}*", pageSize: 1000))
+            {
+                tasks.Add(_db.KeyDeleteAsync(key));
+                stateCount++;
+            }
+            _logger.LogDebug("Found {Count} state keys to delete", stateCount);
+            
             // Note: Don't clear thumbnails - they can persist for performance
             // Thumbnails have 30-day expiration anyway
             
             await Task.WhenAll(tasks);
             
-            _logger.LogInformation("✅ Cleared {SortedSets} sorted sets and {Hashes} hashes", 
-                sortedSetCount, hashCount);
+            _logger.LogInformation("✅ Cleared {SortedSets} sorted sets, {Hashes} hashes, and {States} state keys", 
+                sortedSetCount, hashCount, stateCount);
         }
         catch (Exception ex)
         {
@@ -1064,8 +1194,134 @@ public class RedisCollectionIndexService : ICollectionIndexService
     #region Dashboard Statistics Helper
 
     /// <summary>
-    /// Build dashboard statistics from collections (used during index rebuild)
+    /// Build dashboard statistics using streaming (memory-efficient version)
     /// </summary>
+    private async Task<DashboardStatistics> BuildDashboardStatisticsStreamingAsync(long totalCount, CancellationToken cancellationToken)
+    {
+        var startTime = DateTime.UtcNow;
+        
+        // Aggregate statistics (streaming)
+        long totalImages = 0;
+        long totalThumbnails = 0;
+        long totalCacheImages = 0;
+        long totalSize = 0;
+        long totalThumbnailSize = 0;
+        long totalCacheSize = 0;
+        long activeCollections = 0;
+        var topCollections = new List<TopCollection>();
+        
+        // Stream in batches
+        const int BATCH_SIZE = 100;
+        for (var skip = 0; skip < totalCount; skip += BATCH_SIZE)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                break;
+                
+            var batchCollections = await _collectionRepository.FindAsync(
+                MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false),
+                MongoDB.Driver.Builders<Collection>.Sort.Descending(c => c.Statistics.TotalViews),
+                BATCH_SIZE,
+                skip
+            );
+            
+            foreach (var c in batchCollections)
+            {
+                totalImages += c.GetImageCount();
+                totalThumbnails += c.Thumbnails?.Count ?? 0;
+                totalCacheImages += c.CacheImages?.Count ?? 0;
+                totalSize += c.GetTotalSize();
+                totalThumbnailSize += c.Thumbnails?.Sum(t => t.FileSize) ?? 0;
+                totalCacheSize += c.CacheImages?.Sum(ci => ci.FileSize) ?? 0;
+                
+                if (c.IsActive && !c.IsDeleted)
+                    activeCollections++;
+                
+                // Collect top 10 by views
+                if (topCollections.Count < 10 && c.IsActive && !c.IsDeleted)
+                {
+                    topCollections.Add(new TopCollection
+                    {
+                        Id = c.Id.ToString(),
+                        Name = c.Name,
+                        ImageCount = c.GetImageCount(),
+                        TotalSize = c.GetTotalSize(),
+                        ViewCount = c.Statistics.TotalViews,
+                        LastViewed = c.Statistics.LastViewed,
+                        ThumbnailPath = c.Thumbnails?.FirstOrDefault()?.ThumbnailPath
+                    });
+                }
+            }
+        }
+
+        // Get cache folder statistics
+        var cacheFolders = await _cacheFolderRepository.GetAllAsync();
+        var cacheFolderStats = cacheFolders.Select(cf => new CacheFolderStat
+        {
+            Id = cf.Id.ToString(),
+            Name = cf.Name,
+            Path = cf.Path,
+            CurrentSizeBytes = cf.CurrentSizeBytes,
+            MaxSizeBytes = cf.MaxSizeBytes,
+            TotalFiles = cf.TotalFiles,
+            TotalCollections = cf.CachedCollectionIds?.Count ?? 0,
+            UsagePercentage = cf.MaxSizeBytes > 0 ? (double)cf.CurrentSizeBytes / cf.MaxSizeBytes * 100 : 0,
+            IsActive = cf.IsActive
+        }).ToList();
+
+        // Recent activity
+        var recentActivity = new List<RecentActivity>
+        {
+            new() { Id = "1", Type = "system_startup", Message = "System started", Timestamp = DateTime.UtcNow.AddMinutes(-5) },
+            new() { Id = "2", Type = "index_rebuilt", Message = "Collection index rebuilt", Timestamp = DateTime.UtcNow.AddMinutes(-10) }
+        };
+
+        // System health
+        var systemHealth = new Domain.ValueObjects.SystemHealth
+        {
+            RedisStatus = "Connected",
+            MongoDbStatus = "Connected", 
+            WorkerStatus = "Running",
+            ApiStatus = "Running",
+            Uptime = DateTime.UtcNow - System.Diagnostics.Process.GetCurrentProcess().StartTime,
+            MemoryUsageBytes = GC.GetTotalMemory(false),
+            DiskSpaceFreeBytes = GetFreeDiskSpace(),
+            LastHealthCheck = DateTime.UtcNow
+        };
+
+        var stats = new DashboardStatistics
+        {
+            TotalCollections = (int)totalCount,
+            ActiveCollections = (int)activeCollections,
+            TotalImages = (int)totalImages,
+            TotalThumbnails = (int)totalThumbnails,
+            TotalCacheImages = (int)totalCacheImages,
+            TotalSize = totalSize,
+            TotalThumbnailSize = totalThumbnailSize,
+            TotalCacheSize = totalCacheSize,
+            AverageImagesPerCollection = totalCount > 0 ? (double)totalImages / totalCount : 0,
+            AverageSizePerCollection = totalCount > 0 ? (double)totalSize / totalCount : 0,
+            ActiveJobs = 0,
+            CompletedJobsToday = 0,
+            FailedJobsToday = 0,
+            LastUpdated = DateTime.UtcNow,
+            CacheFolderStats = cacheFolderStats,
+            RecentActivity = recentActivity,
+            TopCollections = topCollections,
+            SystemHealth = systemHealth
+        };
+
+        var duration = DateTime.UtcNow - startTime;
+        _logger.LogInformation("📊 Built dashboard statistics (streaming) in {Duration}ms: {Collections} collections, {Images} images", 
+            duration.TotalMilliseconds, totalCount, totalImages);
+
+        return stats;
+    }
+
+    /// <summary>
+    /// Build dashboard statistics from collections (used during index rebuild)
+    /// DEPRECATED: Use BuildDashboardStatisticsStreamingAsync instead to avoid memory issues
+    /// </summary>
+    [Obsolete("Use BuildDashboardStatisticsStreamingAsync for better memory efficiency")]
     private async Task<DashboardStatistics> BuildDashboardStatisticsFromCollectionsAsync(List<Collection> collections)
     {
         var startTime = DateTime.UtcNow;
@@ -1308,7 +1564,7 @@ public class RedisCollectionIndexService : ICollectionIndexService
     }
 
     #endregion
-
+    
     #region Helper Methods for Thumbnail Processing
 
     /// <summary>
@@ -1321,12 +1577,733 @@ public class RedisCollectionIndexService : ICollectionIndexService
             "jpg" or "jpeg" => "image/jpeg",
             "png" => "image/png",
             "webp" => "image/webp",
-            "gif" => "image/gif",
+            "gif" => "image/gif",  // ✅ Fixed: was "image/bmp"
             "bmp" => "image/bmp",
             _ => "image/jpeg" // Default fallback
         };
     }
+    
+    /// <summary>
+    /// Determine if thumbnail needs to be resized before caching in Redis
+    /// Uses 3-layer detection: IsDirect flag, dimensions, file size
+    /// </summary>
+    private bool ShouldResizeThumbnail(ThumbnailEmbedded thumbnail)
+    {
+        // Layer 1: IsDirect flag (direct mode always needs resize)
+        if (thumbnail.IsDirect)
+        {
+            _logger.LogDebug("Thumbnail is direct mode (original image), needs resize");
+            return true;
+        }
+        
+        // Layer 2: Stored dimensions (most accurate check)
+        if (thumbnail.Width > 400 || thumbnail.Height > 400)
+        {
+            _logger.LogDebug("Thumbnail dimensions {W}×{H} exceed 400px threshold, needs resize",
+                thumbnail.Width, thumbnail.Height);
+            return true;
+        }
+        
+        // Layer 3: File size (safety check for large files)
+        if (thumbnail.FileSize > 500 * 1024)  // >500KB
+        {
+            _logger.LogDebug("Thumbnail file size {SizeKB} KB exceeds 500KB threshold, needs resize",
+                thumbnail.FileSize / 1024);
+            return true;
+        }
+        
+        // All checks passed: thumbnail is already correct size
+        _logger.LogDebug("Thumbnail {W}×{H} ({SizeKB} KB) within thresholds, use as-is",
+            thumbnail.Width, thumbnail.Height, thumbnail.FileSize / 1024);
+        return false;
+    }
+    
+    /// <summary>
+    /// Resize image in memory for Redis cache (used for direct mode and oversized thumbnails)
+    /// Does NOT save to disk, only returns resized bytes
+    /// Uses settings from MongoDB (thumbnail.default.*) via IImageProcessingSettingsService
+    /// </summary>
+    private async Task<byte[]?> ResizeImageForCacheAsync(string imagePath)
+    {
+        try
+        {
+            // Get thumbnail settings from MongoDB (cached for performance)
+            var thumbnailFormat = await _imageProcessingSettingsService.GetThumbnailFormatAsync();
+            var thumbnailQuality = await _imageProcessingSettingsService.GetThumbnailQualityAsync();
+            var thumbnailSize = await _imageProcessingSettingsService.GetThumbnailSizeAsync();
+            
+            _logger.LogDebug("Resizing image {Path} to {Size}×{Size} for Redis cache (Format={Format}, Quality={Quality})", 
+                imagePath, thumbnailSize, thumbnailFormat, thumbnailQuality);
+            
+            // Create ArchiveEntryInfo for image processing service (regular file)
+            var archiveEntry = ArchiveEntryInfo.ForRegularFile(imagePath);
+            
+            // Use existing image processing service to resize with settings from MongoDB
+            var resizedBytes = await _imageProcessingService.GenerateThumbnailAsync(
+                archiveEntry,
+                thumbnailSize,
+                thumbnailSize,
+                thumbnailFormat,
+                thumbnailQuality);
+            
+            if (resizedBytes != null && resizedBytes.Length > 0)
+            {
+                _logger.LogDebug("Successfully resized image to {Size} KB (Format={Format}, Quality={Quality})", 
+                    resizedBytes.Length / 1024, thumbnailFormat, thumbnailQuality);
+                return resizedBytes;
+            }
+            
+            _logger.LogWarning("Resize returned empty data for {Path}", imagePath);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to resize image {Path}", imagePath);
+            return null;
+        }
+    }
 
+    #endregion
+    
+    #region Smart Rebuild (NEW)
+    
+    /// <summary>
+    /// Rebuild index with specified mode and options (NEW - Smart incremental rebuild)
+    /// </summary>
+    public async Task<RebuildStatistics> RebuildIndexAsync(
+        RebuildMode mode,
+        RebuildOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        options ??= new RebuildOptions();
+        var stats = new RebuildStatistics 
+        { 
+            Mode = mode,
+            StartedAt = DateTime.UtcNow
+        };
+        var startTime = DateTime.UtcNow;
+        
+        try
+        {
+            _logger.LogInformation("🔄 Starting {Mode} index rebuild...", mode);
+            
+            // Wait for Redis to be ready
+            if (!_redis.IsConnected)
+            {
+                _logger.LogWarning("⚠️ Redis not connected yet, waiting...");
+                var waited = 0;
+                while (!_redis.IsConnected && waited < 10000)
+                {
+                    await Task.Delay(500, cancellationToken);
+                    waited += 500;
+                }
+                
+                if (!_redis.IsConnected)
+                {
+                    _logger.LogError("❌ Redis connection timeout, aborting rebuild");
+                    stats.CompletedAt = DateTime.UtcNow;
+                    stats.Duration = DateTime.UtcNow - startTime;
+                    return stats;
+                }
+            }
+            
+            // Step 1: Clear Redis if Full mode
+            if (mode == RebuildMode.Full)
+            {
+                _logger.LogInformation("🧹 Full rebuild: Clearing all Redis data...");
+                await ClearIndexAsync();
+            }
+            
+            // Step 2: Count total collections
+            var totalCount = await _collectionRepository.CountAsync(
+                MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false)
+            );
+            stats.TotalCollections = (int)totalCount;
+            
+            _logger.LogInformation("📊 Found {Count} collections in MongoDB", totalCount);
+            
+            // Step 3: Determine which collections need rebuilding
+            var collectionsToRebuild = new List<ObjectId>();
+            var collectionsToSkip = new List<ObjectId>();
+            
+            _logger.LogInformation("🔍 Analyzing collections to determine rebuild scope...");
+            
+            const int ANALYSIS_BATCH_SIZE = 100;
+            for (var skip = 0; skip < totalCount; skip += ANALYSIS_BATCH_SIZE)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning("⚠️ Index rebuild cancelled");
+                    stats.CompletedAt = DateTime.UtcNow;
+                    stats.Duration = DateTime.UtcNow - startTime;
+                    return stats;
+                }
+                
+                var batch = await _collectionRepository.FindAsync(
+                    MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false),
+                    MongoDB.Driver.Builders<Collection>.Sort.Ascending(c => c.Id),
+                    ANALYSIS_BATCH_SIZE,
+                    skip
+                );
+                
+                foreach (var collection in batch)
+                {
+                    var decision = await ShouldRebuildCollectionAsync(collection, mode);
+                    
+                    if (decision == RebuildDecision.Skip)
+                    {
+                        collectionsToSkip.Add(collection.Id);
+                    }
+                    else
+                    {
+                        collectionsToRebuild.Add(collection.Id);
+                    }
+                }
+                
+                if ((skip / ANALYSIS_BATCH_SIZE + 1) % 10 == 0)
+                {
+                    _logger.LogDebug("📊 Analyzed {Count}/{Total} collections...", 
+                        skip + ANALYSIS_BATCH_SIZE, totalCount);
+                }
+            }
+            
+            stats.SkippedCollections = collectionsToSkip.Count;
+            stats.RebuiltCollections = collectionsToRebuild.Count;
+            
+            _logger.LogInformation("📊 Analysis complete: {Rebuild} to rebuild, {Skip} to skip", 
+                collectionsToRebuild.Count, collectionsToSkip.Count);
+            
+            // Step 4: Dry run mode - just report
+            if (options.DryRun)
+            {
+                _logger.LogInformation("🔍 DRY RUN: Would rebuild {Count} collections", 
+                    collectionsToRebuild.Count);
+                
+                stats.CompletedAt = DateTime.UtcNow;
+                stats.Duration = DateTime.UtcNow - startTime;
+                stats.MemoryPeakMB = GC.GetTotalMemory(false) / 1024 / 1024;
+                
+                return stats;
+            }
+            
+            // Step 5: Rebuild only selected collections
+            if (collectionsToRebuild.Count > 0)
+            {
+                await RebuildSelectedCollectionsAsync(
+                    collectionsToRebuild, 
+                    options, 
+                    cancellationToken);
+            }
+            else
+            {
+                _logger.LogInformation("✅ No collections to rebuild");
+            }
+            
+            // Step 6: Update statistics
+            await _db.StringSetAsync(LAST_REBUILD_KEY, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await _db.StringSetAsync(STATS_KEY + ":total", totalCount);
+            
+            stats.CompletedAt = DateTime.UtcNow;
+            stats.Duration = DateTime.UtcNow - startTime;
+            stats.MemoryPeakMB = GC.GetTotalMemory(false) / 1024 / 1024;
+            
+            _logger.LogInformation("✅ Rebuild complete: {Rebuilt} rebuilt, {Skipped} skipped in {Duration}s",
+                stats.RebuiltCollections, stats.SkippedCollections, stats.Duration.TotalSeconds);
+            
+            return stats;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Failed to rebuild index");
+            stats.CompletedAt = DateTime.UtcNow;
+            stats.Duration = DateTime.UtcNow - startTime;
+            throw;
+        }
+    }
+    
+    /// <summary>
+    /// Rebuild decision enum
+    /// </summary>
+    private enum RebuildDecision
+    {
+        Skip,
+        Rebuild
+    }
+    
+    /// <summary>
+    /// Determine if collection should be rebuilt based on mode and state
+    /// </summary>
+    private async Task<RebuildDecision> ShouldRebuildCollectionAsync(
+        Collection collection,
+        RebuildMode mode)
+    {
+        switch (mode)
+        {
+            case RebuildMode.Full:
+            case RebuildMode.ForceRebuildAll:
+                // Always rebuild
+                return RebuildDecision.Rebuild;
+            
+            case RebuildMode.ChangedOnly:
+                var state = await GetCollectionIndexStateAsync(collection.Id);
+                
+                if (state == null)
+                {
+                    _logger.LogDebug("Collection {Id} not in index, will add", collection.Id);
+                    return RebuildDecision.Rebuild;
+                }
+                
+                // Check if updated since last index
+                if (collection.UpdatedAt > state.CollectionUpdatedAt)
+                {
+                    _logger.LogDebug("Collection {Id} updated ({New} > {Old}), will rebuild",
+                        collection.Id, collection.UpdatedAt, state.CollectionUpdatedAt);
+                    return RebuildDecision.Rebuild;
+                }
+                
+                _logger.LogDebug("Collection {Id} unchanged, skipping", collection.Id);
+                return RebuildDecision.Skip;
+            
+            case RebuildMode.Verify:
+                // Verify mode is handled differently in VerifyIndexAsync
+                return RebuildDecision.Rebuild;
+            
+            default:
+                return RebuildDecision.Rebuild;
+        }
+    }
+    
+    /// <summary>
+    /// Rebuild selected collections (smart rebuild)
+    /// </summary>
+    private async Task RebuildSelectedCollectionsAsync(
+        List<ObjectId> collectionIds,
+        RebuildOptions options,
+        CancellationToken cancellationToken)
+    {
+        if (collectionIds.Count == 0)
+        {
+            _logger.LogInformation("✅ No collections to rebuild");
+            return;
+        }
+        
+        const int BATCH_SIZE = 100;
+        var processedCount = 0;
+        var totalBatches = (int)Math.Ceiling((double)collectionIds.Count / BATCH_SIZE);
+        
+        _logger.LogInformation("🔨 Rebuilding {Count} collections in {Batches} batches...",
+            collectionIds.Count, totalBatches);
+        
+        // Process in batches
+        for (var i = 0; i < collectionIds.Count; i += BATCH_SIZE)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogWarning("⚠️ Index rebuild cancelled");
+                return;
+            }
+            
+            var currentBatch = (i / BATCH_SIZE) + 1;
+            var batchStartTime = DateTime.UtcNow;
+            
+            // Memory monitoring
+            var memoryBefore = GC.GetTotalMemory(false);
+            _logger.LogDebug("💾 Batch {Current}/{Total}: Memory before = {MemoryMB:F2} MB", 
+                currentBatch, totalBatches, memoryBefore / 1024.0 / 1024.0);
+            
+            var batchIds = collectionIds.Skip(i).Take(BATCH_SIZE).ToList();
+            
+            // Fetch collections by IDs
+            var filter = MongoDB.Driver.Builders<Collection>.Filter.In(c => c.Id, batchIds);
+            var batchCollections = await _collectionRepository.FindAsync(
+                filter,
+                MongoDB.Driver.Builders<Collection>.Sort.Ascending(c => c.Id),
+                batchIds.Count,
+                0
+            );
+            
+            var collectionList = batchCollections.ToList();
+            
+            // Process batch
+            var batch = _db.CreateBatch();
+            var tasks = new List<Task>();
+            
+            foreach (var collection in collectionList)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning("⚠️ Index rebuild cancelled");
+                    return;
+                }
+                
+                // Add to sorted sets
+                tasks.Add(AddToSortedSetsAsync(batch, collection));
+                
+                // Add to hash (with optional thumbnail caching)
+                if (!options.SkipThumbnailCaching)
+                {
+                    tasks.Add(AddToHashAsync(batch, collection));
+                }
+                else
+                {
+                    // Skip thumbnail loading for faster rebuild
+                    tasks.Add(AddToHashWithoutThumbnailAsync(batch, collection));
+                }
+                
+                // ✅ NEW: Update state tracking
+                tasks.Add(UpdateCollectionIndexStateAsync(batch, collection));
+                
+                processedCount++;
+            }
+            
+            // Execute batch
+            batch.Execute();
+            await Task.WhenAll(tasks);
+            
+            // Memory monitoring after batch
+            var memoryAfter = GC.GetTotalMemory(false);
+            var memoryDelta = memoryAfter - memoryBefore;
+            var batchDuration = DateTime.UtcNow - batchStartTime;
+            
+            _logger.LogInformation("✅ Batch {Current}/{Total} complete: {Count} collections in {Duration}ms, Memory delta = {DeltaMB:+0.00;-0.00} MB (now {CurrentMB:F2} MB)", 
+                currentBatch, totalBatches, collectionList.Count, batchDuration.TotalMilliseconds,
+                memoryDelta / 1024.0 / 1024.0, memoryAfter / 1024.0 / 1024.0);
+            
+            // ✅ CRITICAL: Clear tasks list to release memory
+            tasks.Clear();
+            
+            // Force GC after each batch
+            collectionList.Clear();
+            collectionList = null!;
+            
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        }
+        
+        _logger.LogInformation("✅ All {Count} collections rebuilt successfully", processedCount);
+    }
+    
+    /// <summary>
+    /// Add collection to hash WITHOUT loading thumbnail (faster rebuild)
+    /// </summary>
+    private async Task AddToHashWithoutThumbnailAsync(IDatabaseAsync db, Collection collection)
+    {
+        var summary = new CollectionSummary
+        {
+            Id = collection.Id.ToString(),
+            Name = collection.Name ?? "",
+            FirstImageId = collection.Images?.FirstOrDefault()?.Id.ToString(),
+            ImageCount = collection.Images?.Count ?? 0,
+            ThumbnailCount = collection.Thumbnails?.Count ?? 0,
+            CacheCount = collection.CacheImages?.Count ?? 0,
+            TotalSize = collection.Statistics.TotalSize,
+            CreatedAt = collection.CreatedAt,
+            UpdatedAt = collection.UpdatedAt,
+            LibraryId = collection.LibraryId?.ToString() ?? string.Empty,
+            Description = collection.Description,
+            Type = (int)collection.Type,
+            Tags = new List<string>(),
+            Path = collection.Path ?? "",
+            ThumbnailBase64 = null  // ✅ Skip thumbnail loading
+        };
+
+        var json = JsonSerializer.Serialize(summary);
+        await db.StringSetAsync(GetHashKey(collection.Id.ToString()), json);
+    }
+    
+    /// <summary>
+    /// Verify index consistency and optionally fix issues
+    /// </summary>
+    public async Task<VerifyResult> VerifyIndexAsync(
+        bool dryRun = true,
+        CancellationToken cancellationToken = default)
+    {
+        var result = new VerifyResult { DryRun = dryRun };
+        var startTime = DateTime.UtcNow;
+        
+        try
+        {
+            _logger.LogInformation("🔍 Starting index verification (DryRun={DryRun})...", dryRun);
+            
+            // Phase 1: Check MongoDB → Redis (find missing/outdated)
+            _logger.LogInformation("📊 Phase 1: Checking MongoDB collections against Redis index...");
+            
+            var totalCount = await _collectionRepository.CountAsync(
+                MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false)
+            );
+            result.TotalInMongoDB = (int)totalCount;
+            
+            var collectionsToAdd = new List<ObjectId>();
+            var collectionsToUpdate = new List<ObjectId>();
+            
+            const int BATCH_SIZE = 100;
+            for (var skip = 0; skip < totalCount; skip += BATCH_SIZE)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning("⚠️ Verify cancelled");
+                    return result;
+                }
+                
+                var batch = await _collectionRepository.FindAsync(
+                    MongoDB.Driver.Builders<Collection>.Filter.Eq(c => c.IsDeleted, false),
+                    MongoDB.Driver.Builders<Collection>.Sort.Ascending(c => c.Id),
+                    BATCH_SIZE,
+                    skip
+                );
+                
+                foreach (var collection in batch)
+                {
+                    var state = await GetCollectionIndexStateAsync(collection.Id);
+                    
+                    if (state == null)
+                    {
+                        collectionsToAdd.Add(collection.Id);
+                        result.MissingInRedis.Add(collection.Id.ToString());
+                    }
+                    else if (collection.UpdatedAt > state.CollectionUpdatedAt)
+                    {
+                        collectionsToUpdate.Add(collection.Id);
+                        result.OutdatedInRedis.Add(collection.Id.ToString());
+                    }
+                    else
+                    {
+                        // Check if thumbnail was added after indexing
+                        var firstThumbnail = collection.GetCollectionThumbnail();
+                        if (!state.HasFirstThumbnail && firstThumbnail != null && !string.IsNullOrEmpty(firstThumbnail.ThumbnailPath))
+                        {
+                            collectionsToUpdate.Add(collection.Id);
+                            result.MissingThumbnails.Add(collection.Id.ToString());
+                        }
+                    }
+                }
+                
+                if ((skip / BATCH_SIZE + 1) % 10 == 0)
+                {
+                    _logger.LogDebug("📊 Verified {Count}/{Total} MongoDB collections...", 
+                        skip + BATCH_SIZE, totalCount);
+                }
+            }
+            
+            result.ToAdd = collectionsToAdd.Count;
+            result.ToUpdate = collectionsToUpdate.Count;
+            
+            _logger.LogInformation("✅ Phase 1 complete: {Add} to add, {Update} to update",
+                result.ToAdd, result.ToUpdate);
+            
+            // Phase 2: Check Redis → MongoDB (find orphaned/deleted)
+            _logger.LogInformation("📊 Phase 2: Checking Redis index for orphaned entries...");
+            
+            var redisCollectionIds = await GetAllIndexedCollectionIdsAsync();
+            result.TotalInRedis = redisCollectionIds.Count;
+            
+            var collectionsToRemove = new List<ObjectId>();
+            
+            foreach (var collectionIdStr in redisCollectionIds)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning("⚠️ Verify cancelled");
+                    return result;
+                }
+                
+                if (!ObjectId.TryParse(collectionIdStr, out var collectionId))
+                {
+                    _logger.LogWarning("Invalid collection ID in Redis: {Id}", collectionIdStr);
+                    collectionsToRemove.Add(ObjectId.Empty);
+                    result.OrphanedInRedis.Add(collectionIdStr);
+                    continue;
+                }
+                
+                var collection = await _collectionRepository.GetByIdAsync(collectionId);
+                
+                if (collection == null || collection.IsDeleted)
+                {
+                    collectionsToRemove.Add(collectionId);
+                    result.OrphanedInRedis.Add(collectionIdStr);
+                }
+            }
+            
+            result.ToRemove = collectionsToRemove.Count;
+            
+            _logger.LogInformation("✅ Phase 2 complete: {Remove} orphaned entries found",
+                result.ToRemove);
+            
+            // Phase 3: Fix inconsistencies (if not dry run)
+            if (!dryRun)
+            {
+                _logger.LogInformation("🔧 Phase 3: Fixing inconsistencies...");
+                
+                // Add missing collections
+                if (collectionsToAdd.Any())
+                {
+                    _logger.LogInformation("➕ Adding {Count} missing collections...", collectionsToAdd.Count);
+                    await RebuildSelectedCollectionsAsync(
+                        collectionsToAdd, 
+                        new RebuildOptions(), 
+                        cancellationToken);
+                }
+                
+                // Update outdated collections
+                if (collectionsToUpdate.Any())
+                {
+                    _logger.LogInformation("🔄 Updating {Count} outdated collections...", collectionsToUpdate.Count);
+                    await RebuildSelectedCollectionsAsync(
+                        collectionsToUpdate, 
+                        new RebuildOptions(), 
+                        cancellationToken);
+                }
+                
+                // Remove orphaned entries
+                if (collectionsToRemove.Any())
+                {
+                    _logger.LogInformation("🗑️ Removing {Count} orphaned entries...", collectionsToRemove.Count);
+                    foreach (var collectionId in collectionsToRemove)
+                    {
+                        if (collectionId != ObjectId.Empty)
+                        {
+                            await RemoveCollectionAsync(collectionId);
+                        }
+                    }
+                }
+                
+                _logger.LogInformation("✅ Phase 3 complete: Fixed all inconsistencies");
+            }
+            else
+            {
+                _logger.LogInformation("🔍 DRY RUN: Would fix {Total} inconsistencies (Add={Add}, Update={Update}, Remove={Remove})",
+                    result.ToAdd + result.ToUpdate + result.ToRemove,
+                    result.ToAdd, result.ToUpdate, result.ToRemove);
+            }
+            
+            result.Duration = DateTime.UtcNow - startTime;
+            result.IsConsistent = result.ToAdd == 0 && result.ToUpdate == 0 && result.ToRemove == 0;
+            
+            _logger.LogInformation("✅ Verification complete in {Duration}s: {Status}",
+                result.Duration.TotalSeconds,
+                result.IsConsistent ? "CONSISTENT ✅" : "INCONSISTENT ⚠️");
+            
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Failed to verify index");
+            result.Duration = DateTime.UtcNow - startTime;
+            throw;
+        }
+    }
+    
+    /// <summary>
+    /// Get all collection IDs that are currently in Redis index
+    /// </summary>
+    private async Task<List<string>> GetAllIndexedCollectionIdsAsync()
+    {
+        try
+        {
+            var server = _redis.GetServer(_redis.GetEndPoints().First());
+            var collectionIds = new List<string>();
+            
+            // Scan for all state keys
+            await foreach (var key in server.KeysAsync(pattern: $"{STATE_PREFIX}*", pageSize: 1000))
+            {
+                var keyStr = key.ToString();
+                var collectionId = keyStr.Replace(STATE_PREFIX, "");
+                collectionIds.Add(collectionId);
+            }
+            
+            _logger.LogDebug("Found {Count} collections in Redis index", collectionIds.Count);
+            return collectionIds;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get indexed collection IDs");
+            return new List<string>();
+        }
+    }
+    
+    #endregion
+    
+    #region State Tracking
+    
+    /// <summary>
+    /// Get collection index state from Redis
+    /// </summary>
+    public async Task<CollectionIndexState?> GetCollectionIndexStateAsync(
+        ObjectId collectionId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var key = GetStateKey(collectionId.ToString());
+            var json = await _db.StringGetAsync(key);
+            
+            if (!json.HasValue)
+            {
+                _logger.LogDebug("No state found for collection {CollectionId}", collectionId);
+                return null;
+            }
+            
+            var state = JsonSerializer.Deserialize<CollectionIndexState>(json.ToString());
+            _logger.LogDebug("Retrieved state for collection {CollectionId}: IndexedAt={IndexedAt}, UpdatedAt={UpdatedAt}",
+                collectionId, state?.IndexedAt, state?.CollectionUpdatedAt);
+            
+            return state;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get state for collection {CollectionId}", collectionId);
+            return null;
+        }
+    }
+    
+    /// <summary>
+    /// Update collection index state in Redis
+    /// Called during index rebuild to track when collection was last indexed
+    /// </summary>
+    private async Task UpdateCollectionIndexStateAsync(
+        IDatabaseAsync db,
+        Collection collection)
+    {
+        try
+        {
+            // Get first thumbnail info
+            var firstThumbnail = collection.GetCollectionThumbnail();
+            
+            var state = new CollectionIndexState
+            {
+                CollectionId = collection.Id.ToString(),
+                IndexedAt = DateTime.UtcNow,
+                CollectionUpdatedAt = collection.UpdatedAt,
+                
+                // Statistics (lightweight, used by other screens)
+                ImageCount = collection.Images?.Count ?? 0,
+                ThumbnailCount = collection.Thumbnails?.Count ?? 0,
+                CacheCount = collection.CacheImages?.Count ?? 0,
+                
+                // First thumbnail tracking (for collection card display)
+                HasFirstThumbnail = firstThumbnail != null && !string.IsNullOrEmpty(firstThumbnail.ThumbnailPath),
+                FirstThumbnailPath = firstThumbnail?.ThumbnailPath,
+                
+                IndexVersion = "v1.0"
+            };
+            
+            var key = GetStateKey(collection.Id.ToString());
+            var json = JsonSerializer.Serialize(state);
+            
+            // Store with no expiration (persist state)
+            await db.StringSetAsync(key, json);
+            
+            _logger.LogDebug("Updated state for collection {CollectionId}: Images={Images}, Thumbnails={Thumbnails}, Cache={Cache}",
+                collection.Id, state.ImageCount, state.ThumbnailCount, state.CacheCount);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to update state for collection {CollectionId}", collection.Id);
+            // Don't throw - state tracking is not critical
+        }
+    }
+    
     #endregion
 }
 

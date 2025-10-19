@@ -52,6 +52,7 @@ public class BulkController : ControllerBase
                     ["OverwriteExisting"] = request.OverwriteExisting,
                     ["ProcessCompressedFiles"] = true, // Default to true for compressed files
                     ["MaxConcurrentOperations"] = 5, // Default to 5 concurrent operations
+                    ["UseDirectFileAccess"] = request.UseDirectFileAccess,
                     ["CreatedAfter"] = request.CreatedAfter,
                     ["CreatedBefore"] = request.CreatedBefore,
                     ["ModifiedAfter"] = request.ModifiedAfter,

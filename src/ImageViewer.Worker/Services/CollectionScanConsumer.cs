@@ -139,49 +139,70 @@ public class CollectionScanConsumer : BaseMessageConsumer
             _logger.LogDebug("📁 Found {FileCount} media files in collection {CollectionId}", 
                 mediaFiles.Count, collection.Id);
 
-            // Create image processing jobs for each media file
-            foreach (var mediaFile in mediaFiles)
+            // Check if direct file access mode is enabled and valid for this collection
+            var useDirectAccess = scanMessage.UseDirectFileAccess && collection.Type == CollectionType.Folder;
+            
+            if (useDirectAccess)
             {
-                try
-                {
-                    // Extract basic metadata for the image processing message
-                    var archiveEntry = ArchiveEntryInfo.FromCollection(
-                        collection.Path, 
-                        collection.Type, 
-                        mediaFile.FileName, 
-                        mediaFile.FileSize);
-
-                    var (width, height) = await ExtractImageDimensions(archiveEntry);
-                    
-                    var imageProcessingMessage = new ImageProcessingMessage
-                    {
-                        ImageId = ObjectId.GenerateNewId().ToString(), // Will be set when image is created, convert to string
-                        CollectionId = collection.Id.ToString(), // Convert ObjectId to string
-                        //ImagePath = mediaFile.FullPath,
-                        ArchiveEntry = archiveEntry,
-                        ImageFormat = mediaFile.Extension,
-                        Width = width,
-                        Height = height,
-                        FileSize = mediaFile.FileSize,
-                        GenerateThumbnail = true,
-                        OptimizeImage = false,
-                        CreatedBy = "CollectionScanConsumer",
-                        CreatedBySystem = "ImageViewer.Worker",
-                        ScanJobId = scanMessage.JobId // Pass scan job ID for tracking
-                    };
-
-                    // Queue the image processing job
-                    await messageQueueService.PublishAsync(imageProcessingMessage, "image.processing");
-                    _logger.LogDebug("📋 Queued image processing job for {ImagePath}", mediaFile.FullPath);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "❌ Failed to create image processing job for {ImagePath}", mediaFile.FullPath);
-                }
+                _logger.LogInformation("🚀 Direct file access mode enabled for directory collection {Name} ({FileCount} files)", 
+                    collection.Name, mediaFiles.Count);
+                
+                // Direct mode: Create image/thumbnail/cache references without queue processing
+                await ProcessDirectFileAccessMode(collection, mediaFiles, scope, backgroundJobService, scanMessage.JobId);
             }
+            else
+            {
+                // Standard mode: Queue image processing jobs
+                if (collection.Type != CollectionType.Folder && scanMessage.UseDirectFileAccess)
+                {
+                    _logger.LogInformation("⚠️ Direct file access mode requested but collection {Name} is an archive ({Type}), using standard mode", 
+                        collection.Name, collection.Type);
+                }
+                
+                // Create image processing jobs for each media file
+                foreach (var mediaFile in mediaFiles)
+                {
+                    try
+                    {
+                        // Extract basic metadata for the image processing message
+                        var archiveEntry = ArchiveEntryInfo.FromCollection(
+                            collection.Path, 
+                            collection.Type, 
+                            mediaFile.FileName, 
+                            mediaFile.FileSize);
 
-            _logger.LogDebug("✅ Successfully processed collection scan for {CollectionId}, queued {JobCount} image processing jobs", 
-                collection.Id, mediaFiles.Count);
+                        var (width, height) = await ExtractImageDimensions(archiveEntry);
+                        
+                        var imageProcessingMessage = new ImageProcessingMessage
+                        {
+                            ImageId = ObjectId.GenerateNewId().ToString(), // Will be set when image is created, convert to string
+                            CollectionId = collection.Id.ToString(), // Convert ObjectId to string
+                            //ImagePath = mediaFile.FullPath,
+                            ArchiveEntry = archiveEntry,
+                            ImageFormat = mediaFile.Extension,
+                            Width = width,
+                            Height = height,
+                            FileSize = mediaFile.FileSize,
+                            GenerateThumbnail = true,
+                            OptimizeImage = false,
+                            CreatedBy = "CollectionScanConsumer",
+                            CreatedBySystem = "ImageViewer.Worker",
+                            ScanJobId = scanMessage.JobId // Pass scan job ID for tracking
+                        };
+
+                        // Queue the image processing job
+                        await messageQueueService.PublishAsync(imageProcessingMessage, "image.processing");
+                        _logger.LogDebug("📋 Queued image processing job for {ImagePath}", mediaFile.FullPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "❌ Failed to create image processing job for {ImagePath}", mediaFile.FullPath);
+                    }
+                }
+
+                _logger.LogDebug("✅ Successfully processed collection scan for {CollectionId}, queued {JobCount} image processing jobs", 
+                    collection.Id, mediaFiles.Count);
+            }
 
             // Update library statistics if collection belongs to a library
             if (collection.LibraryId.HasValue && collection.LibraryId.Value != ObjectId.Empty)
@@ -223,25 +244,48 @@ public class CollectionScanConsumer : BaseMessageConsumer
                     
                     _logger.LogInformation("✅ Scan stage completed for job {JobId}: {Count} files found", scanMessage.JobId, mediaFiles.Count);
                     
-                    // Initialize thumbnail/cache stages as Pending with correct totalItems
-                    // This ensures the stages exist before monitoring starts
-                    await backgroundJobService.UpdateJobStageAsync(
-                        ObjectId.Parse(scanMessage.JobId), 
-                        "thumbnail", 
-                        "Pending", 
-                        0, 
-                        mediaFiles.Count, 
-                        $"Waiting to generate {mediaFiles.Count} thumbnails");
-                    
-                    await backgroundJobService.UpdateJobStageAsync(
-                        ObjectId.Parse(scanMessage.JobId), 
-                        "cache", 
-                        "Pending", 
-                        0, 
-                        mediaFiles.Count, 
-                        $"Waiting to generate {mediaFiles.Count} cache files");
-                    
-                    _logger.LogInformation("📝 Initialized stages for job {JobId} - Centralized JobMonitoringService will track completion", scanMessage.JobId);
+                    if (useDirectAccess)
+                    {
+                        // Direct mode: Mark thumbnail/cache stages as completed immediately
+                        await backgroundJobService.UpdateJobStageAsync(
+                            ObjectId.Parse(scanMessage.JobId), 
+                            "thumbnail", 
+                            "Completed", 
+                            mediaFiles.Count, 
+                            mediaFiles.Count, 
+                            $"Using direct file access (no generation needed)");
+                        
+                        await backgroundJobService.UpdateJobStageAsync(
+                            ObjectId.Parse(scanMessage.JobId), 
+                            "cache", 
+                            "Completed", 
+                            mediaFiles.Count, 
+                            mediaFiles.Count, 
+                            $"Using direct file access (no generation needed)");
+                        
+                        _logger.LogInformation("✅ Direct mode: All stages completed for job {JobId}", scanMessage.JobId);
+                    }
+                    else
+                    {
+                        // Standard mode: Initialize thumbnail/cache stages as Pending
+                        await backgroundJobService.UpdateJobStageAsync(
+                            ObjectId.Parse(scanMessage.JobId), 
+                            "thumbnail", 
+                            "Pending", 
+                            0, 
+                            mediaFiles.Count, 
+                            $"Waiting to generate {mediaFiles.Count} thumbnails");
+                        
+                        await backgroundJobService.UpdateJobStageAsync(
+                            ObjectId.Parse(scanMessage.JobId), 
+                            "cache", 
+                            "Pending", 
+                            0, 
+                            mediaFiles.Count, 
+                            $"Waiting to generate {mediaFiles.Count} cache files");
+                        
+                        _logger.LogInformation("📝 Initialized stages for job {JobId} - Centralized JobMonitoringService will track completion", scanMessage.JobId);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -389,16 +433,15 @@ public class CollectionScanConsumer : BaseMessageConsumer
                 return (0, 0); // Will be extracted during image processing
             }
             
-            // For regular files, try to extract dimensions
+            // For regular files, extract dimensions using IImageProcessingService
             if (File.Exists(archiveEntry.GetPhysicalFileFullPath()))
             {
-                var metadata = await imageProcessingService.ExtractMetadataAsync(archiveEntry);
-                if (metadata != null)
+                var dimensions = await imageProcessingService.GetImageDimensionsAsync(archiveEntry);
+                if (dimensions != null && dimensions.Width > 0 && dimensions.Height > 0)
                 {
-                    // Note: The current ImageMetadata doesn't expose width/height
-                    // This would need to be enhanced in the IImageProcessingService
-                    _logger.LogDebug("📊 Extracted metadata for {Path}#{Entry}", archiveEntry.ArchivePath, archiveEntry.EntryName);
-                    return (0, 0); // Will be extracted during image processing
+                    _logger.LogDebug("📊 Extracted dimensions for {Path}: {Width}x{Height}", 
+                        archiveEntry.GetPhysicalFileFullPath(), dimensions.Width, dimensions.Height);
+                    return (dimensions.Width, dimensions.Height);
                 }
             }
             
@@ -413,6 +456,113 @@ public class CollectionScanConsumer : BaseMessageConsumer
 
     // Monitoring is now handled by centralized JobMonitoringService
     // No need for per-job monitoring tasks that can fail or get disposed
+
+    /// <summary>
+    /// Process collection in direct file access mode (directory collections only)
+    /// Creates image/thumbnail/cache entries that reference original files directly
+    /// Skips cache/thumbnail generation entirely for massive speed and disk space savings
+    /// </summary>
+    private async Task ProcessDirectFileAccessMode(
+        Domain.Entities.Collection collection,
+        List<MediaFileInfo> mediaFiles,
+        IServiceScope scope,
+        IBackgroundJobService backgroundJobService,
+        string? jobId)
+    {
+        try
+        {
+            _logger.LogInformation("📦 Processing {Count} files in direct file access mode for collection {Name}", 
+                mediaFiles.Count, collection.Name);
+            
+            var collectionRepository = scope.ServiceProvider.GetRequiredService<ICollectionRepository>();
+            var imagesToAdd = new List<ImageEmbedded>();
+            var thumbnailsToAdd = new List<ThumbnailEmbedded>();
+            var cacheImagesToAdd = new List<CacheImageEmbedded>();
+            
+            foreach (var mediaFile in mediaFiles)
+            {
+                try
+                {
+                    // Extract image dimensions
+                    var archiveEntry = ArchiveEntryInfo.FromCollection(
+                        collection.Path, 
+                        collection.Type, 
+                        mediaFile.FileName, 
+                        mediaFile.FileSize);
+                    var (width, height) = await ExtractImageDimensions(archiveEntry);
+                    
+                    // Create image embedded (no archiveEntry for directory files)
+                    var image = new ImageEmbedded(
+                        filename: mediaFile.FileName,
+                        relativePath: mediaFile.RelativePath,
+                        fileSize: mediaFile.FileSize,
+                        width: width > 0 ? width : 0,
+                        height: height > 0 ? height : 0,
+                        format: mediaFile.Extension.TrimStart('.'));
+                    
+                    imagesToAdd.Add(image);
+                    
+                    // Get the generated image ID after adding to list
+                    var imageId = image.Id;
+                    var fullPath = Path.Combine(collection.Path, mediaFile.FileName);
+                    
+                    // Create direct reference thumbnail (points to original file)
+                    var thumbnail = ThumbnailEmbedded.CreateDirectReference(
+                        imageId: imageId,
+                        originalFilePath: fullPath,
+                        width: width > 0 ? width : 1920, // Use actual width or default
+                        height: height > 0 ? height : 1080,
+                        fileSize: mediaFile.FileSize,
+                        format: mediaFile.Extension.TrimStart('.').ToLowerInvariant());
+                    
+                    thumbnailsToAdd.Add(thumbnail);
+                    
+                    // Create direct reference cache (points to original file)
+                    var cacheImage = CacheImageEmbedded.CreateDirectReference(
+                        imageId: imageId,
+                        originalFilePath: fullPath,
+                        width: width > 0 ? width : 1920,
+                        height: height > 0 ? height : 1080,
+                        fileSize: mediaFile.FileSize,
+                        format: mediaFile.Extension.TrimStart('.').ToLowerInvariant());
+                    
+                    cacheImagesToAdd.Add(cacheImage);
+                    
+                    _logger.LogDebug("✅ Created direct references for {FileName} → {ImageId}", 
+                        mediaFile.FileName, imageId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to create direct references for {FileName}, skipping", 
+                        mediaFile.FileName);
+                }
+            }
+            
+            // Atomically add all images, thumbnails, and cache references to collection
+            _logger.LogInformation("💾 Adding {Count} images with direct references to collection {CollectionId}", 
+                imagesToAdd.Count, collection.Id);
+            
+            // Add images one by one (no batch method available)
+            foreach (var image in imagesToAdd)
+            {
+                await collectionRepository.AtomicAddImageAsync(collection.Id, image);
+            }
+            
+            // Add thumbnails and cache images in batch
+            await collectionRepository.AtomicAddThumbnailsAsync(collection.Id, thumbnailsToAdd);
+            await collectionRepository.AtomicAddCacheImagesAsync(collection.Id, cacheImagesToAdd);
+            
+            _logger.LogInformation("✅ Direct mode complete: Added {ImageCount} images, {ThumbnailCount} thumbnails, {CacheCount} cache references to collection {Name}", 
+                imagesToAdd.Count, thumbnailsToAdd.Count, cacheImagesToAdd.Count, collection.Name);
+            _logger.LogInformation("💾 Disk space saved: ~{SavedGB:F2} GB (no cache/thumbnail copies generated)", 
+                (imagesToAdd.Sum(i => i.FileSize) * 0.4) / 1024.0 / 1024.0 / 1024.0);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error processing direct file access mode for collection {CollectionId}", collection.Id);
+            throw;
+        }
+    }
 
     private class MediaFileInfo
     {

@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useCollections } from '../hooks/useCollections';
 import { useHotkeys, CommonHotkeys } from '../hooks/useHotkeys';
+import { useRandomNavigation } from '../hooks/useRandomNavigation';
 import { Card, CardContent } from '../components/ui/Card';
 import Button from '../components/ui/Button';
 import LoadingSpinner from '../components/ui/LoadingSpinner';
@@ -19,7 +20,8 @@ import {
   ListTree,
   Maximize2,
   Minimize2,
-  Zap
+  Zap,
+  Shuffle
 } from 'lucide-react';
 import type { Collection } from '../services/types';
 
@@ -38,6 +40,9 @@ type CardSize = 'mini' | 'tiny' | 'small' | 'medium' | 'large' | 'xlarge';
  */
 const Collections: React.FC = () => {
   const navigate = useNavigate();
+  
+  // Random navigation with Ctrl+Shift+R hotkey
+  const { handleRandom, isLoading: isRandomLoading } = useRandomNavigation();
   
   // Restore page and search from sessionStorage when returning to this screen
   const [page, setPage] = useState(() => {
@@ -306,6 +311,17 @@ const Collections: React.FC = () => {
                 >
                   <Zap className="h-4 w-4" />
                   <span className="hidden lg:inline text-xs">Bulk</span>
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleRandom}
+                  disabled={isRandomLoading}
+                  className="flex items-center space-x-1.5 rounded-md text-purple-400 hover:text-purple-300 hover:bg-purple-500/10"
+                  title="Random Collection (Ctrl+Shift+R)"
+                >
+                  <Shuffle className={`h-4 w-4 ${isRandomLoading ? 'animate-spin' : ''}`} />
+                  <span className="hidden lg:inline text-xs">Random</span>
                 </Button>
               </div>
             </div>

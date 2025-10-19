@@ -7,6 +7,7 @@ using ImageViewer.Infrastructure.Data;
 using ImageViewer.Application.Services;
 using MongoDB.Bson;
 using ImageViewer.Domain.ValueObjects;
+using ImageViewer.Domain.Enums;
 
 namespace ImageViewer.Worker.Services;
 
@@ -151,6 +152,7 @@ public class BulkOperationConsumer : BaseMessageConsumer
             var overwriteExisting = parameters.GetValueOrDefault("OverwriteExisting")?.ToString() == "True";
             var processCompressedFiles = parameters.GetValueOrDefault("ProcessCompressedFiles")?.ToString() == "True";
             var maxConcurrentOperations = int.TryParse(parameters.GetValueOrDefault("MaxConcurrentOperations")?.ToString(), out var maxConcurrent) ? maxConcurrent : 5;
+            var useDirectFileAccess = parameters.GetValueOrDefault("UseDirectFileAccess")?.ToString() == "True";
 
             _logger.LogInformation("📋 Extracted parameters:");
             _logger.LogInformation("   📁 ParentPath: {ParentPath}", parentPath);
@@ -160,6 +162,7 @@ public class BulkOperationConsumer : BaseMessageConsumer
             _logger.LogInformation("   🔄 OverwriteExisting: {OverwriteExisting}", overwriteExisting);
             _logger.LogInformation("   📦 ProcessCompressedFiles: {ProcessCompressedFiles}", processCompressedFiles);
             _logger.LogInformation("   ⚡ MaxConcurrentOperations: {MaxConcurrentOperations}", maxConcurrentOperations);
+            _logger.LogInformation("   🚀 UseDirectFileAccess: {UseDirectFileAccess}", useDirectFileAccess);
 
             // Create the bulk request from message parameters
             var bulkRequest = new BulkAddCollectionsRequest
@@ -170,7 +173,8 @@ public class BulkOperationConsumer : BaseMessageConsumer
                 AutoAdd = autoAdd,
                 OverwriteExisting = overwriteExisting,
                 EnableCache = processCompressedFiles, // Map to existing property
-                AutoScan = true // Enable auto scan
+                AutoScan = true, // Enable auto scan
+                UseDirectFileAccess = useDirectFileAccess // Pass direct file access flag
             };
 
             _logger.LogInformation("🚀 Starting bulk add collections for path: {ParentPath}", bulkRequest.ParentPath);
@@ -299,9 +303,19 @@ public class BulkOperationConsumer : BaseMessageConsumer
         // Get all images using embedded design - iterate through collections
         var collections = await collectionService.GetCollectionsAsync(page: 1, pageSize: 1000);
         int totalImages = 0;
+        int skippedCollections = 0;
         
         foreach (var collection in collections)
         {
+            // Skip collections using direct file access mode (they don't need generated thumbnails)
+            if (collection.Settings.UseDirectFileAccess && collection.Type == CollectionType.Folder)
+            {
+                _logger.LogInformation("⏭️ Skipping collection {Name} - using direct file access mode (no thumbnail generation needed)", 
+                    collection.Name);
+                skippedCollections++;
+                continue;
+            }
+            
             var collectionImages = await imageService.GetEmbeddedImagesByCollectionAsync(collection.Id);
             totalImages += collectionImages.Count();
             
@@ -337,7 +351,8 @@ public class BulkOperationConsumer : BaseMessageConsumer
         }
         }
         
-        _logger.LogInformation("✅ Created {ThumbnailJobCount} thumbnail generation jobs for {CollectionCount} collections", totalImages, collections.Count());
+        _logger.LogInformation("✅ Created {ThumbnailJobCount} thumbnail generation jobs for {CollectionCount} collections (skipped {SkippedCount} direct mode collections)", 
+            totalImages, collections.Count() - skippedCollections, skippedCollections);
     }
 
     private async Task ProcessGenerateAllCacheAsync(BulkOperationMessage bulkMessage, IMessageQueueService messageQueueService)
@@ -371,9 +386,19 @@ public class BulkOperationConsumer : BaseMessageConsumer
         // Get all images using embedded design - iterate through collections
         var collections = await collectionService.GetCollectionsAsync(page: 1, pageSize: 1000);
         int totalImages = 0;
+        int skippedCollections = 0;
         
         foreach (var collection in collections)
         {
+            // Skip collections using direct file access mode (they don't need generated cache)
+            if (collection.Settings.UseDirectFileAccess && collection.Type == CollectionType.Folder)
+            {
+                _logger.LogInformation("⏭️ Skipping collection {Name} - using direct file access mode (no cache generation needed)", 
+                    collection.Name);
+                skippedCollections++;
+                continue;
+            }
+            
             var collectionImages = await imageService.GetEmbeddedImagesByCollectionAsync(collection.Id);
             totalImages += collectionImages.Count();
             
@@ -412,7 +437,8 @@ public class BulkOperationConsumer : BaseMessageConsumer
         }
         }
         
-        _logger.LogInformation("✅ Created {CacheJobCount} cache generation jobs for {CollectionCount} collections", totalImages, collections.Count());
+        _logger.LogInformation("✅ Created {CacheJobCount} cache generation jobs for {CollectionCount} collections (skipped {SkippedCount} direct mode collections)", 
+            totalImages, collections.Count() - skippedCollections, skippedCollections);
     }
 
     private async Task ProcessScanCollectionsAsync(BulkOperationMessage bulkMessage, IMessageQueueService messageQueueService)

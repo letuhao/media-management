@@ -119,6 +119,7 @@ public class UpdateCollectionSettingsRequest
     public long? MaxFileSize { get; set; }
     public List<string>? AllowedFormats { get; set; }
     public List<string>? ExcludedPaths { get; set; }
+    public bool? UseDirectFileAccess { get; set; }
 }
 
 /// <summary>

@@ -4,6 +4,7 @@ import { useCollection } from '../hooks/useCollections';
 import { useImages } from '../hooks/useImages';
 import { useCollectionNavigation } from '../hooks/useCollectionNavigation';
 import { useHotkeys, CommonHotkeys } from '../hooks/useHotkeys';
+import { useRandomNavigation } from '../hooks/useRandomNavigation';
 import Button from '../components/ui/Button';
 import LoadingSpinner from '../components/ui/LoadingSpinner';
 import ImageGrid from '../components/ImageGrid';
@@ -23,7 +24,8 @@ import {
   Info,
   Grid3x3,
   List,
-  ListTree
+  ListTree,
+  Shuffle
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -38,6 +40,9 @@ type CardSize = 'mini' | 'tiny' | 'small' | 'medium' | 'large' | 'xlarge';
 const CollectionDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  
+  // Random navigation with Ctrl+Shift+R hotkey
+  const { handleRandom, isLoading: isRandomLoading } = useRandomNavigation();
   
   // Restore page from sessionStorage for THIS specific collection
   const sessionKey = `collectionDetail_${id}_page`;
@@ -301,6 +306,17 @@ const CollectionDetail: React.FC = () => {
               <div className="flex items-center space-x-2">
                 <Button variant="secondary" icon={<RotateCw className="h-4 w-4" />} size="sm">
                   Rescan
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleRandom}
+                  disabled={isRandomLoading}
+                  className="text-purple-400 hover:text-purple-300 hover:bg-purple-500/10"
+                  title="Random Collection (Ctrl+Shift+R)"
+                  icon={<Shuffle className={`h-4 w-4 ${isRandomLoading ? 'animate-spin' : ''}`} />}
+                >
+                  Random
                 </Button>
                 <Button
                   icon={<Play className="h-4 w-4" />}

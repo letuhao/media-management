@@ -6,6 +6,7 @@ import { useCollectionNavigation } from '../hooks/useCollectionNavigation';
 import { useCrossCollectionNavigation } from '../hooks/useCrossCollectionNavigation';
 import { useUserSettings } from '../hooks/useSettings';
 import { useHotkeys, CommonHotkeys } from '../hooks/useHotkeys';
+import { useRandomNavigation } from '../hooks/useRandomNavigation';
 import LoadingSpinner from '../components/ui/LoadingSpinner';
 import MediaDisplay from '../components/media/MediaDisplay';
 import { useUI } from '../contexts/UIContext';
@@ -65,6 +66,9 @@ const ImageViewer: React.FC = () => {
   const { id: collectionId } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  
+  // Random navigation with Ctrl+Shift+R hotkey (stays in viewer, loads random collection)
+  const { handleRandom } = useRandomNavigation();
 
   const initialImageId = searchParams.get('imageId');
   const goToLast = searchParams.get('goToLast') === 'true';

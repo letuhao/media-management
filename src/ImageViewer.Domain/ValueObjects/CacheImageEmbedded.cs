@@ -58,6 +58,10 @@ public class CacheImageEmbedded
     [BsonElement("updatedAt")]
     public DateTime UpdatedAt { get; private set; }
     
+    // Direct file access tracking
+    [BsonElement("isDirect")]
+    public bool IsDirect { get; private set; }
+    
     // Error tracking fields
     [BsonElement("isDummy")]
     public bool IsDummy { get; private set; }
@@ -166,6 +170,31 @@ public class CacheImageEmbedded
         ErrorType = errorType;
         FailedAt = DateTime.UtcNow;
         UpdatedAt = DateTime.UtcNow;
+    }
+    
+    /// <summary>
+    /// Create a direct reference cache image (points to original file instead of generated copy)
+    /// Used for directory collections in direct file access mode
+    /// </summary>
+    public static CacheImageEmbedded CreateDirectReference(string imageId, string originalFilePath, int width, int height, long fileSize, string format)
+    {
+        var cacheImage = new CacheImageEmbedded();
+        cacheImage.ImageId = imageId ?? throw new ArgumentNullException(nameof(imageId));
+        cacheImage.CachePath = originalFilePath ?? throw new ArgumentNullException(nameof(originalFilePath));
+        cacheImage.Width = width;
+        cacheImage.Height = height;
+        cacheImage.FileSize = fileSize;
+        cacheImage.Format = format ?? throw new ArgumentNullException(nameof(format));
+        cacheImage.Quality = 100; // Original quality
+        cacheImage.IsGenerated = true; // Considered "generated" for consistency
+        cacheImage.GeneratedAt = DateTime.UtcNow;
+        cacheImage.AccessCount = 0;
+        cacheImage.IsValid = true;
+        cacheImage.IsDirect = true; // Mark as direct reference
+        cacheImage.IsDummy = false;
+        cacheImage.CreatedAt = DateTime.UtcNow;
+        cacheImage.UpdatedAt = DateTime.UtcNow;
+        return cacheImage;
     }
 }
 

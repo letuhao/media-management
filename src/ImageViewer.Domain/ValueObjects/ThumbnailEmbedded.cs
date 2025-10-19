@@ -57,6 +57,10 @@ public class ThumbnailEmbedded
     [BsonElement("updatedAt")]
     public DateTime UpdatedAt { get; private set; }
     
+    // Direct file access tracking
+    [BsonElement("isDirect")]
+    public bool IsDirect { get; private set; }
+    
     // Error tracking fields
     [BsonElement("isDummy")]
     public bool IsDummy { get; private set; }
@@ -165,5 +169,30 @@ public class ThumbnailEmbedded
         ErrorType = errorType;
         FailedAt = DateTime.UtcNow;
         UpdatedAt = DateTime.UtcNow;
+    }
+    
+    /// <summary>
+    /// Create a direct reference thumbnail (points to original file instead of generated copy)
+    /// Used for directory collections in direct file access mode
+    /// </summary>
+    public static ThumbnailEmbedded CreateDirectReference(string imageId, string originalFilePath, int width, int height, long fileSize, string format)
+    {
+        var thumbnail = new ThumbnailEmbedded();
+        thumbnail.ImageId = imageId ?? throw new ArgumentNullException(nameof(imageId));
+        thumbnail.ThumbnailPath = originalFilePath ?? throw new ArgumentNullException(nameof(originalFilePath));
+        thumbnail.Width = width;
+        thumbnail.Height = height;
+        thumbnail.FileSize = fileSize;
+        thumbnail.Format = format ?? throw new ArgumentNullException(nameof(format));
+        thumbnail.Quality = 100; // Original quality
+        thumbnail.IsGenerated = true; // Considered "generated" for consistency
+        thumbnail.GeneratedAt = DateTime.UtcNow;
+        thumbnail.AccessCount = 0;
+        thumbnail.IsValid = true;
+        thumbnail.IsDirect = true; // Mark as direct reference
+        thumbnail.IsDummy = false;
+        thumbnail.CreatedAt = DateTime.UtcNow;
+        thumbnail.UpdatedAt = DateTime.UtcNow;
+        return thumbnail;
     }
 }

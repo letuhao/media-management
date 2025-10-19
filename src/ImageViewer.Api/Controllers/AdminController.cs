@@ -9,17 +9,20 @@ namespace ImageViewer.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/v1/admin")]
-[Authorize] // Add proper admin authorization in the future
+[Authorize(Roles = "Admin")] // ✅ Admin role required for all admin endpoints
 public class AdminController : ControllerBase
 {
     private readonly IMetadataRecalculationService _metadataRecalculationService;
+    private readonly ICollectionIndexService _collectionIndexService;
     private readonly ILogger<AdminController> _logger;
 
     public AdminController(
         IMetadataRecalculationService metadataRecalculationService,
+        ICollectionIndexService collectionIndexService,
         ILogger<AdminController> logger)
     {
         _metadataRecalculationService = metadataRecalculationService;
+        _collectionIndexService = collectionIndexService;
         _logger = logger;
     }
 
@@ -123,6 +126,100 @@ public class AdminController : ControllerBase
     }
 
     /// <summary>
+    /// Rebuild Redis collection index with smart modes
+    /// </summary>
+    [HttpPost("index/rebuild")]
+    [ProducesResponseType(typeof(RebuildStatistics), 200)]
+    [ProducesResponseType(400)]
+    [ProducesResponseType(500)]
+    public async Task<IActionResult> RebuildIndex([FromBody] RebuildIndexRequest request)
+    {
+        try
+        {
+            _logger.LogInformation("Admin triggered index rebuild: Mode={Mode}, SkipThumbnails={SkipThumbnails}, DryRun={DryRun}",
+                request.Mode, request.SkipThumbnailCaching, request.DryRun);
+            
+            var options = new RebuildOptions
+            {
+                SkipThumbnailCaching = request.SkipThumbnailCaching,
+                DryRun = request.DryRun
+            };
+            
+            var stats = await _collectionIndexService.RebuildIndexAsync(
+                request.Mode,
+                options,
+                HttpContext.RequestAborted);
+            
+            return Ok(stats);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Failed to rebuild index");
+            return StatusCode(500, new { message = "Failed to rebuild index", error = ex.Message });
+        }
+    }
+    
+    /// <summary>
+    /// Verify Redis index consistency and optionally fix issues
+    /// </summary>
+    [HttpPost("index/verify")]
+    [ProducesResponseType(typeof(VerifyResult), 200)]
+    [ProducesResponseType(400)]
+    [ProducesResponseType(500)]
+    public async Task<IActionResult> VerifyIndex([FromBody] VerifyIndexRequest request)
+    {
+        try
+        {
+            _logger.LogInformation("Admin triggered index verification: DryRun={DryRun}", request.DryRun);
+            
+            var result = await _collectionIndexService.VerifyIndexAsync(
+                request.DryRun,
+                HttpContext.RequestAborted);
+            
+            return Ok(result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Failed to verify index");
+            return StatusCode(500, new { message = "Failed to verify index", error = ex.Message });
+        }
+    }
+    
+    /// <summary>
+    /// Get collection index state for a specific collection
+    /// </summary>
+    [HttpGet("index/state/{collectionId}")]
+    [ProducesResponseType(typeof(CollectionIndexState), 200)]
+    [ProducesResponseType(404)]
+    [ProducesResponseType(500)]
+    public async Task<IActionResult> GetCollectionIndexState(string collectionId)
+    {
+        try
+        {
+            if (!MongoDB.Bson.ObjectId.TryParse(collectionId, out var objectId))
+            {
+                return BadRequest(new { message = "Invalid collection ID" });
+            }
+            
+            var state = await _collectionIndexService.GetCollectionIndexStateAsync(
+                objectId,
+                HttpContext.RequestAborted);
+            
+            if (state == null)
+            {
+                return NotFound(new { message = "Collection state not found in index" });
+            }
+            
+            return Ok(state);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Failed to get collection index state");
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
+        }
+    }
+
+    /// <summary>
     /// Get system health and metadata status
     /// </summary>
     [HttpGet("system-health")]
@@ -157,4 +254,22 @@ public class AdminController : ControllerBase
             return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }
+}
+
+/// <summary>
+/// Request for rebuilding index
+/// </summary>
+public class RebuildIndexRequest
+{
+    public RebuildMode Mode { get; set; } = RebuildMode.ChangedOnly;
+    public bool SkipThumbnailCaching { get; set; } = false;
+    public bool DryRun { get; set; } = false;
+}
+
+/// <summary>
+/// Request for verifying index
+/// </summary>
+public class VerifyIndexRequest
+{
+    public bool DryRun { get; set; } = true;
 }

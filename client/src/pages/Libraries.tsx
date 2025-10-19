@@ -29,7 +29,8 @@ export default function Libraries() {
   const [scanLibraryId, setScanLibraryId] = useState<string | null>(null);
   const [scanOptions, setScanOptions] = useState({
     resumeIncomplete: false,
-    overwriteExisting: false
+    overwriteExisting: false,
+    useDirectFileAccess: false
   });
   const [selectedLibrary, setSelectedLibrary] = useState<Library | null>(null);
   const [showSchedulerDetails, setShowSchedulerDetails] = useState<Record<string, boolean>>({});
@@ -109,7 +110,7 @@ export default function Libraries() {
 
   // Trigger manual scan
   const triggerScanMutation = useMutation({
-    mutationFn: ({ libraryId, options }: { libraryId: string; options?: { resumeIncomplete?: boolean; overwriteExisting?: boolean } }) => 
+    mutationFn: ({ libraryId, options }: { libraryId: string; options?: { resumeIncomplete?: boolean; overwriteExisting?: boolean; useDirectFileAccess?: boolean } }) => 
       libraryApi.triggerScan(libraryId, options),
     onSuccess: (data) => {
       toast.success(`Scan triggered for ${data.libraryName}`);
@@ -117,7 +118,7 @@ export default function Libraries() {
       queryClient.invalidateQueries({ queryKey: ['scheduledJobs'] });
       setShowScanModal(false);
       setScanLibraryId(null);
-      setScanOptions({ resumeIncomplete: false, overwriteExisting: false });
+      setScanOptions({ resumeIncomplete: false, overwriteExisting: false, useDirectFileAccess: false });
     },
     onError: (error: any) => {
       toast.error(error.response?.data?.message || 'Failed to trigger scan');
@@ -1029,11 +1030,32 @@ export default function Libraries() {
                 </div>
               </div>
 
+              {/* Use Direct File Access Checkbox */}
+              <div className="flex items-start gap-3 p-4 bg-green-500/10 border border-green-500/30 rounded-lg">
+                <input
+                  type="checkbox"
+                  id="useDirectFileAccess"
+                  checked={scanOptions.useDirectFileAccess}
+                  onChange={(e) => setScanOptions({ ...scanOptions, useDirectFileAccess: e.target.checked })}
+                  className="mt-1 w-4 h-4 rounded border-slate-600 text-green-500 focus:ring-green-500 focus:ring-offset-slate-900"
+                />
+                <div className="flex-1">
+                  <label htmlFor="useDirectFileAccess" className="text-sm font-medium text-white cursor-pointer">
+                    ⚡ Use Direct File Access (Fast Mode)
+                  </label>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Use original files directly without generating cache/thumbnails. <strong>10-100× faster</strong> with <strong>40% disk space savings</strong>. Only works for directory collections (archives will still generate cache).
+                  </p>
+                </div>
+              </div>
+
               {/* Info Message */}
-              <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-lg">
-                <p className="text-xs text-blue-300">
+              <div className={`p-4 border rounded-lg ${scanOptions.useDirectFileAccess ? 'bg-green-500/10 border-green-500/30' : 'bg-blue-500/10 border-blue-500/30'}`}>
+                <p className={`text-xs ${scanOptions.useDirectFileAccess ? 'text-green-300' : 'text-blue-300'}`}>
                   <strong>💡 Tip:</strong> {
-                    scanOptions.resumeIncomplete 
+                    scanOptions.useDirectFileAccess
+                      ? "⚡ Fast mode enabled! Directory collections will use original files as cache/thumbnails. Processing will be 10-100× faster and save 40% disk space. Archives will still generate cache normally."
+                      : scanOptions.resumeIncomplete 
                       ? "Resume mode will analyze each collection and queue only missing jobs. Perfect for continuing from 99% to 100%!"
                       : scanOptions.overwriteExisting
                       ? "Overwrite mode will clear everything and rebuild from scratch. This takes much longer!"

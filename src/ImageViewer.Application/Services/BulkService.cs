@@ -157,7 +157,8 @@ public class BulkService : IBulkService
                     ScanInterval = settings.ScanInterval,
                     MaxFileSize = settings.MaxFileSize,
                     AllowedFormats = settings.AllowedFormats?.ToList(),
-                    ExcludedPaths = settings.ExcludedPaths?.ToList()
+                    ExcludedPaths = settings.ExcludedPaths?.ToList(),
+                    UseDirectFileAccess = settings.UseDirectFileAccess
                 };
                 collection = await _collectionService.UpdateSettingsAsync(
                     collection.Id, 
@@ -181,18 +182,41 @@ public class BulkService : IBulkService
                     _logger.LogInformation("ResumeIncomplete=true: Collection {Name} has {ImageCount} images, {ThumbnailCount} thumbnails, {CacheCount} cache. Missing: {MissingThumbnails} thumbnails, {MissingCache} cache", 
                         potential.Name, imageCount, thumbnailCount, cacheCount, missingThumbnails, missingCache);
                     
-                    // Queue ONLY missing thumbnail/cache jobs (no re-scan)
-                    await QueueMissingThumbnailCacheJobsAsync(existingCollection, request, cancellationToken);
+                    // Check if direct mode is enabled AND collection is directory
+                    var useDirectMode = request.UseDirectFileAccess && existingCollection.Type == CollectionType.Folder;
                     
-                    return new BulkCollectionResult
+                    if (useDirectMode)
                     {
-                        Name = potential.Name,
-                        Path = potential.Path,
-                        Type = potential.Type,
-                        Status = "Resumed",
-                        Message = $"Resumed: {missingThumbnails} thumbnails, {missingCache} cache (no re-scan)",
-                        CollectionId = existingCollection.Id
-                    };
+                        // Direct mode: Create direct references for missing items (no queue)
+                        _logger.LogInformation("🚀 Direct mode enabled for resume: Creating direct references for {MissingCount} items", 
+                            missingThumbnails + missingCache);
+                        await CreateDirectReferencesForMissingItemsAsync(existingCollection, cancellationToken);
+                        
+                        return new BulkCollectionResult
+                        {
+                            Name = potential.Name,
+                            Path = potential.Path,
+                            Type = potential.Type,
+                            Status = "Resumed",
+                            Message = $"Resumed (Direct Mode): Created direct references for {missingThumbnails} thumbnails, {missingCache} cache",
+                            CollectionId = existingCollection.Id
+                        };
+                    }
+                    else
+                    {
+                        // Standard mode: Queue ONLY missing thumbnail/cache jobs (no re-scan)
+                        await QueueMissingThumbnailCacheJobsAsync(existingCollection, request, cancellationToken);
+                        
+                        return new BulkCollectionResult
+                        {
+                            Name = potential.Name,
+                            Path = potential.Path,
+                            Type = potential.Type,
+                            Status = "Resumed",
+                            Message = $"Resumed: {missingThumbnails} thumbnails, {missingCache} cache (no re-scan)",
+                            CollectionId = existingCollection.Id
+                        };
+                    }
                 }
                 else
                 {
@@ -236,7 +260,8 @@ public class BulkService : IBulkService
                     ScanInterval = settings.ScanInterval,
                     MaxFileSize = settings.MaxFileSize,
                     AllowedFormats = settings.AllowedFormats?.ToList(),
-                    ExcludedPaths = settings.ExcludedPaths?.ToList()
+                    ExcludedPaths = settings.ExcludedPaths?.ToList(),
+                    UseDirectFileAccess = settings.UseDirectFileAccess
                 };
                 collection = await _collectionService.UpdateSettingsAsync(
                     collection.Id, 
@@ -286,7 +311,8 @@ public class BulkService : IBulkService
                 ScanInterval = settings.ScanInterval,
                 MaxFileSize = settings.MaxFileSize,
                 AllowedFormats = settings.AllowedFormats?.ToList(),
-                ExcludedPaths = settings.ExcludedPaths?.ToList()
+                ExcludedPaths = settings.ExcludedPaths?.ToList(),
+                UseDirectFileAccess = settings.UseDirectFileAccess
             };
             collection = await _collectionService.UpdateSettingsAsync(collection.Id, settingsRequest, triggerScan: false); // Don't trigger scan - already triggered by CreateCollectionAsync
             
@@ -319,6 +345,8 @@ public class BulkService : IBulkService
         settings.SetAutoGenerateThumbnails(request.EnableCache ?? true);
         // Map AutoScan to AutoGenerateCache - when AutoScan is true, enable auto cache generation
         settings.SetAutoGenerateCache(request.AutoScan ?? true);
+        // Set direct file access mode (only effective for directory collections)
+        settings.SetDirectFileAccess(request.UseDirectFileAccess);
         return settings;
     }
 
@@ -700,6 +728,94 @@ public class BulkService : IBulkService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error queuing missing thumbnail/cache jobs for collection {CollectionId}", collection.Id);
+            throw;
+        }
+    }
+    
+    /// <summary>
+    /// Create direct references for missing thumbnails/cache (used in resume + direct mode)
+    /// Instead of generating new files, points to original files for directory collections
+    /// </summary>
+    private async Task CreateDirectReferencesForMissingItemsAsync(
+        Collection collection,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            _logger.LogInformation("📦 Creating direct references for missing items in collection {Name}", collection.Name);
+            
+            // Get collection repository
+            var collectionRepository = _serviceProvider.GetRequiredService<ICollectionRepository>();
+            
+            // Get images that don't have thumbnails
+            var imagesNeedingThumbnails = collection.Images?
+                .Where(img => !(collection.Thumbnails?.Any(t => t.ImageId == img.Id) ?? false))
+                .ToList() ?? new List<ImageEmbedded>();
+            
+            // Get images that don't have cache
+            var imagesNeedingCache = collection.Images?
+                .Where(img => !(collection.CacheImages?.Any(c => c.ImageId == img.Id) ?? false))
+                .ToList() ?? new List<ImageEmbedded>();
+            
+            _logger.LogInformation("Collection {Name}: Creating {ThumbnailCount} direct thumbnail refs, {CacheCount} direct cache refs", 
+                collection.Name, imagesNeedingThumbnails.Count, imagesNeedingCache.Count);
+            
+            var thumbnailsToAdd = new List<ThumbnailEmbedded>();
+            var cacheImagesToAdd = new List<CacheImageEmbedded>();
+            
+            // Create direct reference thumbnails
+            foreach (var image in imagesNeedingThumbnails)
+            {
+                var fullPath = Path.Combine(collection.Path, image.Filename);
+                
+                var thumbnail = ThumbnailEmbedded.CreateDirectReference(
+                    imageId: image.Id,
+                    originalFilePath: fullPath,
+                    width: image.Width > 0 ? image.Width : 1920,
+                    height: image.Height > 0 ? image.Height : 1080,
+                    fileSize: image.FileSize,
+                    format: Path.GetExtension(image.Filename).TrimStart('.').ToLowerInvariant());
+                
+                thumbnailsToAdd.Add(thumbnail);
+            }
+            
+            // Create direct reference cache images
+            foreach (var image in imagesNeedingCache)
+            {
+                var fullPath = Path.Combine(collection.Path, image.Filename);
+                
+                var cacheImage = CacheImageEmbedded.CreateDirectReference(
+                    imageId: image.Id,
+                    originalFilePath: fullPath,
+                    width: image.Width > 0 ? image.Width : 1920,
+                    height: image.Height > 0 ? image.Height : 1080,
+                    fileSize: image.FileSize,
+                    format: Path.GetExtension(image.Filename).TrimStart('.').ToLowerInvariant());
+                
+                cacheImagesToAdd.Add(cacheImage);
+            }
+            
+            // Atomically add to collection
+            if (thumbnailsToAdd.Count > 0)
+            {
+                await collectionRepository.AtomicAddThumbnailsAsync(collection.Id, thumbnailsToAdd);
+                _logger.LogInformation("✅ Added {Count} direct thumbnail references to collection {Name}", 
+                    thumbnailsToAdd.Count, collection.Name);
+            }
+            
+            if (cacheImagesToAdd.Count > 0)
+            {
+                await collectionRepository.AtomicAddCacheImagesAsync(collection.Id, cacheImagesToAdd);
+                _logger.LogInformation("✅ Added {Count} direct cache references to collection {Name}", 
+                    cacheImagesToAdd.Count, collection.Name);
+            }
+            
+            _logger.LogInformation("💾 Direct mode resume complete: {ThumbnailCount} thumbnails + {CacheCount} cache (instant, no generation needed)", 
+                thumbnailsToAdd.Count, cacheImagesToAdd.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error creating direct references for collection {CollectionId}", collection.Id);
             throw;
         }
     }

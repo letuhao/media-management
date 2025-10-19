@@ -15,8 +15,33 @@ public interface ICollectionIndexService
     /// <summary>
     /// Rebuild entire collection index from database.
     /// Called on startup or manually via API.
+    /// Uses ChangedOnly mode by default for performance.
     /// </summary>
     Task RebuildIndexAsync(CancellationToken cancellationToken = default);
+    
+    /// <summary>
+    /// Rebuild collection index with specified mode and options.
+    /// Supports smart incremental rebuilds for better performance.
+    /// </summary>
+    Task<RebuildStatistics> RebuildIndexAsync(
+        RebuildMode mode,
+        RebuildOptions? options = null,
+        CancellationToken cancellationToken = default);
+    
+    /// <summary>
+    /// Verify index consistency and optionally fix issues.
+    /// Checks MongoDB vs Redis and removes orphaned entries.
+    /// </summary>
+    Task<VerifyResult> VerifyIndexAsync(
+        bool dryRun = true,
+        CancellationToken cancellationToken = default);
+    
+    /// <summary>
+    /// Get collection index state (when it was last indexed, counts, etc.)
+    /// </summary>
+    Task<CollectionIndexState?> GetCollectionIndexStateAsync(
+        ObjectId collectionId,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Add or update a single collection in the index.
@@ -239,5 +264,103 @@ public class CollectionIndexStats
     public DateTime? LastRebuildTime { get; set; }
     public bool IsValid { get; set; }
     public Dictionary<string, int> SortedSetSizes { get; set; } = new();
+}
+
+/// <summary>
+/// Rebuild mode selection
+/// </summary>
+public enum RebuildMode
+{
+    /// <summary>
+    /// Only rebuild collections where UpdatedAt > IndexedAt (DEFAULT, fastest for daily use)
+    /// </summary>
+    ChangedOnly,
+    
+    /// <summary>
+    /// Verify consistency between MongoDB and Redis, fix issues (cleanup orphaned entries)
+    /// </summary>
+    Verify,
+    
+    /// <summary>
+    /// Clear ALL Redis data and rebuild everything from scratch
+    /// </summary>
+    Full,
+    
+    /// <summary>
+    /// Rebuild ALL collections without clearing Redis (for schema changes)
+    /// </summary>
+    ForceRebuildAll
+}
+
+/// <summary>
+/// Options for rebuild operation
+/// </summary>
+public class RebuildOptions
+{
+    /// <summary>
+    /// Skip loading thumbnail files and converting to base64 (faster, but collection cards won't show thumbnails)
+    /// </summary>
+    public bool SkipThumbnailCaching { get; set; } = false;
+    
+    /// <summary>
+    /// Only analyze and report what would be rebuilt, don't actually rebuild
+    /// </summary>
+    public bool DryRun { get; set; } = false;
+}
+
+/// <summary>
+/// Statistics from rebuild operation
+/// </summary>
+public class RebuildStatistics
+{
+    public RebuildMode Mode { get; set; }
+    public int TotalCollections { get; set; }
+    public int SkippedCollections { get; set; }
+    public int RebuiltCollections { get; set; }
+    public TimeSpan Duration { get; set; }
+    public long MemoryPeakMB { get; set; }
+    public DateTime StartedAt { get; set; }
+    public DateTime CompletedAt { get; set; }
+}
+
+/// <summary>
+/// Result from verify operation
+/// </summary>
+public class VerifyResult
+{
+    public bool IsConsistent { get; set; }
+    public int TotalInMongoDB { get; set; }
+    public int TotalInRedis { get; set; }
+    public int ToAdd { get; set; }
+    public int ToUpdate { get; set; }
+    public int ToRemove { get; set; }
+    public List<string> MissingInRedis { get; set; } = new();
+    public List<string> OutdatedInRedis { get; set; } = new();
+    public List<string> MissingThumbnails { get; set; } = new();
+    public List<string> OrphanedInRedis { get; set; } = new();
+    public TimeSpan Duration { get; set; }
+    public bool DryRun { get; set; }
+}
+
+/// <summary>
+/// Collection index state - tracks when collection was last indexed and its state
+/// Stored in Redis with key: collection_index:state:{collectionId}
+/// </summary>
+public class CollectionIndexState
+{
+    public string CollectionId { get; set; } = string.Empty;
+    public DateTime IndexedAt { get; set; }
+    public DateTime CollectionUpdatedAt { get; set; }
+    
+    // Statistics (used by other screens, lightweight to include)
+    public int ImageCount { get; set; }
+    public int ThumbnailCount { get; set; }
+    public int CacheCount { get; set; }
+    
+    // First thumbnail tracking (for collection card display)
+    public bool HasFirstThumbnail { get; set; }
+    public string? FirstThumbnailPath { get; set; }
+    
+    public string IndexVersion { get; set; } = "v1.0";
 }
 

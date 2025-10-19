@@ -111,6 +111,7 @@ public class CollectionService : ICollectionService
                     CollectionPath = createdCollection.Path,
                     CollectionType = createdCollection.Type,
                     ForceRescan = false,
+                    UseDirectFileAccess = createdCollection.Settings.UseDirectFileAccess && createdCollection.Type == CollectionType.Folder,
                     CreatedBy = "CollectionService",
                     CreatedBySystem = "ImageViewer.Application",
                     JobId = scanJob.JobId.ToString() // Link message to job for tracking!
@@ -415,6 +416,11 @@ public class CollectionService : ICollectionService
                 }
             }
             
+            if (request.UseDirectFileAccess.HasValue)
+            {
+                newSettings.SetDirectFileAccess(request.UseDirectFileAccess.Value);
+            }
+            
             collection.UpdateSettings(newSettings);
             var updatedCollection = await _collectionRepository.UpdateAsync(collection);
             
@@ -437,6 +443,7 @@ public class CollectionService : ICollectionService
                 CollectionPath = collection.Path,
                 CollectionType = collection.Type,
                 ForceRescan = forceRescan, // Use the parameter to control rescan behavior
+                UseDirectFileAccess = collection.Settings.UseDirectFileAccess && collection.Type == CollectionType.Folder,
                 CreatedBy = "CollectionService",
                 CreatedBySystem = "ImageViewer.Application",
                 JobId = scanJob.JobId.ToString() // Link message to job for tracking!

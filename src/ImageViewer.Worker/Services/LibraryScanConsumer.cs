@@ -134,6 +134,7 @@ public class LibraryScanConsumer : BaseMessageConsumer
                     AutoAdd = false, // We don't auto-add, we control creation
                     OverwriteExisting = scanMessage.OverwriteExisting, // Pass from message
                     ResumeIncomplete = scanMessage.ResumeIncomplete, // Pass from message
+                    UseDirectFileAccess = scanMessage.UseDirectFileAccess, // Pass direct mode flag
                     AutoScan = library.Settings?.AutoScan ?? false,
                     EnableCache = library.Settings?.CacheSettings?.Enabled ?? true,
                     ThumbnailWidth = library.Settings?.ThumbnailSettings?.Width,

@@ -70,6 +70,9 @@ public class BulkAddCollectionsRequest
     
     [JsonPropertyName("modifiedBefore")]
     public DateTime? ModifiedBefore { get; set; }
+    
+    [JsonPropertyName("useDirectFileAccess")]
+    public bool UseDirectFileAccess { get; set; } = false;
 }
 
 /// <summary>

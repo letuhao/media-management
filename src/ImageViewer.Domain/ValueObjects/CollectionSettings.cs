@@ -36,6 +36,9 @@ public class CollectionSettings
     
     [BsonElement("autoGenerateCache")]
     public bool AutoGenerateCache { get; private set; }
+    
+    [BsonElement("useDirectFileAccess")]
+    public bool UseDirectFileAccess { get; private set; }
 
     public CollectionSettings()
     {
@@ -49,6 +52,7 @@ public class CollectionSettings
         AllowedFormats = new List<string> { "jpg", "jpeg", "png", "gif", "bmp", "webp", "mp4", "avi", "mov" };
         ExcludedPaths = new List<string>();
         AutoGenerateCache = true;
+        UseDirectFileAccess = false; // Default: false for backward compatibility
     }
 
     public void Enable()
@@ -135,5 +139,14 @@ public class CollectionSettings
     public void SetAutoGenerateCache(bool autoGenerate)
     {
         GenerateCache = autoGenerate;
+    }
+    
+    /// <summary>
+    /// Enable/disable direct file access mode (directory collections only)
+    /// When enabled, original files are used as cache/thumbnails instead of generating copies
+    /// </summary>
+    public void SetDirectFileAccess(bool enabled)
+    {
+        UseDirectFileAccess = enabled;
     }
 }

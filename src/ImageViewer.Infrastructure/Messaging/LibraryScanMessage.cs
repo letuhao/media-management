@@ -16,6 +16,7 @@ public class LibraryScanMessage : MessageEvent
     public bool IncludeSubfolders { get; set; } = true;
     public bool ResumeIncomplete { get; set; } = false;
     public bool OverwriteExisting { get; set; } = false;
+    public bool UseDirectFileAccess { get; set; } = false;
 
     public LibraryScanMessage()
     {

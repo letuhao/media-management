@@ -119,7 +119,8 @@ public class LibrariesController : ControllerBase
                 ScanType = "Manual",
                 IncludeSubfolders = true,
                 ResumeIncomplete = request?.ResumeIncomplete ?? false,
-                OverwriteExisting = request?.OverwriteExisting ?? false
+                OverwriteExisting = request?.OverwriteExisting ?? false,
+                UseDirectFileAccess = request?.UseDirectFileAccess ?? false
             };
 
             _logger.LogInformation("About to publish LibraryScanMessage: LibraryId={LibraryId}, MessageType={MessageType}, MessageId={MessageId}", 
@@ -752,4 +753,5 @@ public class TriggerScanRequest
 {
     public bool ResumeIncomplete { get; set; } = false;
     public bool OverwriteExisting { get; set; } = false;
+    public bool UseDirectFileAccess { get; set; } = false;
 }

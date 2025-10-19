@@ -11,6 +11,7 @@ public class CollectionScanMessage : MessageEvent
     public string CollectionPath { get; set; } = string.Empty;
     public CollectionType CollectionType { get; set; }
     public bool ForceRescan { get; set; }
+    public bool UseDirectFileAccess { get; set; } = false; // Use original files as cache/thumbnails (directory collections only)
     public string? CreatedBy { get; set; }
     public string? CreatedBySystem { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
