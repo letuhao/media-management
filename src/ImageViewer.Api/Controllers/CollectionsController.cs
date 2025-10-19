@@ -290,6 +290,7 @@ public class CollectionsController : ControllerBase
                 sortDirection);
             
             // Convert CollectionSummary to CollectionOverviewDto
+            // Thumbnails are already pre-cached as base64 in Redis index for instant display!
             var overviewDtos = pageResult.Collections.Select(summary => new CollectionOverviewDto
             {
                 Id = summary.Id,
@@ -304,36 +305,13 @@ public class CollectionsController : ControllerBase
                 UpdatedAt = summary.UpdatedAt,
                 ThumbnailPath = summary.FirstImageThumbnailUrl,
                 ThumbnailImageId = summary.FirstImageId,
-                HasThumbnail = !string.IsNullOrEmpty(summary.FirstImageThumbnailUrl),
+                HasThumbnail = !string.IsNullOrEmpty(summary.ThumbnailBase64),
                 FirstImageId = summary.FirstImageId,
-                ThumbnailBase64 = null // Will be populated below
+                ThumbnailBase64 = summary.ThumbnailBase64 // ✅ Already pre-cached in Redis!
             }).ToList();
             
-            // Populate base64 thumbnails in parallel for instant display (highest performance)
-            var thumbnailTasks = pageResult.Collections.Select(async (summary, index) =>
-            {
-                if (!string.IsNullOrEmpty(summary.FirstImageThumbnailUrl) && !string.IsNullOrEmpty(summary.FirstImageId))
-                {
-                    // Create a ThumbnailEmbedded object using the constructor
-                    var thumbnailEmbedded = new ThumbnailEmbedded(
-                        summary.FirstImageId,
-                        summary.FirstImageThumbnailUrl,
-                        150, // Default width
-                        150, // Default height
-                        0,   // Default file size
-                        "jpeg", // Default format
-                        95   // Default quality
-                    );
-                    
-                    var base64 = await _thumbnailCacheService.GetThumbnailAsBase64Async(
-                        summary.Id, 
-                        thumbnailEmbedded);
-                    overviewDtos[index].ThumbnailBase64 = base64;
-                }
-            });
-            
-            await Task.WhenAll(thumbnailTasks);
-            _logger.LogDebug("Populated {Count} thumbnails as base64", overviewDtos.Count(d => d.ThumbnailBase64 != null));
+            _logger.LogDebug("Returned {Count} collections with {ThumbnailCount} pre-cached thumbnails", 
+                overviewDtos.Count, overviewDtos.Count(d => d.ThumbnailBase64 != null));
             
             // Create paginated response using Redis cache data
             var response = new

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using ImageViewer.Application.Mappings;
 using ImageViewer.Domain.Entities;
 using ImageViewer.Domain.Interfaces;
 using ImageViewer.Domain.ValueObjects;
@@ -595,6 +596,44 @@ public class RedisCollectionIndexService : ICollectionIndexService
 
     private async Task AddToHashAsync(IDatabaseAsync db, Collection collection)
     {
+        // Get thumbnail and convert to base64 for caching
+        string? thumbnailBase64 = null;
+        var thumbnail = collection.GetCollectionThumbnail();
+        
+        if (thumbnail != null && !string.IsNullOrEmpty(thumbnail.ThumbnailPath))
+        {
+            try
+            {
+                // Check if thumbnail file exists
+                if (File.Exists(thumbnail.ThumbnailPath))
+                {
+                    // Load binary data from disk
+                    var bytes = await File.ReadAllBytesAsync(thumbnail.ThumbnailPath);
+                    
+                    // Convert to base64 string
+                    var base64 = Convert.ToBase64String(bytes);
+                    
+                    // Create data URL with proper content type
+                    var contentType = GetContentTypeFromFormat(thumbnail.Format);
+                    thumbnailBase64 = $"data:{contentType};base64,{base64}";
+                    
+                    _logger.LogDebug("Cached base64 thumbnail for collection {CollectionId}, size: {Size} KB", 
+                        collection.Id, base64.Length / 1024);
+                }
+                else
+                {
+                    _logger.LogDebug("Thumbnail file not found for collection {CollectionId} at path: {Path}", 
+                        collection.Id, thumbnail.ThumbnailPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to load thumbnail for collection {CollectionId}, skipping base64 caching", 
+                    collection.Id);
+                // Continue without thumbnail - non-critical
+            }
+        }
+        
         var summary = new CollectionSummary
         {
             Id = collection.Id.ToString(),
@@ -612,7 +651,10 @@ public class RedisCollectionIndexService : ICollectionIndexService
             Description = collection.Description,
             Type = (int)collection.Type,
             Tags = new List<string>(), // TODO: Add tags support when Collection entity has it
-            Path = collection.Path ?? ""
+            Path = collection.Path ?? "",
+            
+            // Pre-computed base64 thumbnail (optimization)
+            ThumbnailBase64 = thumbnailBase64
         };
 
         var json = JsonSerializer.Serialize(summary);
@@ -1263,6 +1305,26 @@ public class RedisCollectionIndexService : ICollectionIndexService
             _logger.LogWarning(ex, "Failed to check dashboard statistics freshness");
             return false;
         }
+    }
+
+    #endregion
+
+    #region Helper Methods for Thumbnail Processing
+
+    /// <summary>
+    /// Get MIME content type from thumbnail format
+    /// </summary>
+    private static string GetContentTypeFromFormat(string format)
+    {
+        return format.ToLower() switch
+        {
+            "jpg" or "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            _ => "image/jpeg" // Default fallback
+        };
     }
 
     #endregion

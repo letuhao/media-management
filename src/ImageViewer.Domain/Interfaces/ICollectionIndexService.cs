@@ -222,6 +222,12 @@ public class CollectionSummary
     public int Type { get; set; } // CollectionType enum as int
     public List<string> Tags { get; set; } = new();
     public string Path { get; set; } = string.Empty;
+    
+    /// <summary>
+    /// Pre-computed base64-encoded thumbnail data URL (e.g., data:image/jpeg;base64,...)
+    /// Cached during index build for instant display without conversion overhead
+    /// </summary>
+    public string? ThumbnailBase64 { get; set; }
 }
 
 /// <summary>

@@ -134,9 +134,13 @@ public class BulkOperationConsumer : BaseMessageConsumer
 
     private async Task ProcessBulkAddCollectionsAsync(BulkOperationMessage bulkMessage, IBulkService bulkService, IBackgroundJobService backgroundJobService, IMessageQueueService messageQueueService)
     {
+        var message = string.Empty;
+
         try
         {
             _logger.LogInformation("📦 Processing bulk add collections operation");
+
+            message = bulkMessage.JobId;
 
             // Extract parameters from the bulk message
             var parameters = bulkMessage.Parameters;
