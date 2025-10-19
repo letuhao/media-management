@@ -41,8 +41,8 @@ const CollectionDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   
-  // Random navigation with Ctrl+Shift+R hotkey
-  const { handleRandom, isLoading: isRandomLoading } = useRandomNavigation();
+  // Random navigation (hotkey registered in Header only to avoid double-call)
+  const { handleRandom, isLoading: isRandomLoading } = useRandomNavigation(true, false);
   
   // Restore page from sessionStorage for THIS specific collection
   const sessionKey = `collectionDetail_${id}_page`;

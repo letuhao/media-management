@@ -67,8 +67,8 @@ const ImageViewer: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   
-  // Random navigation with Ctrl+Shift+R hotkey (stays in viewer, loads random collection)
-  const { handleRandom } = useRandomNavigation();
+  // Random navigation (hotkey registered in Header only to avoid double-call)
+  const { handleRandom } = useRandomNavigation(true, false);
 
   const initialImageId = searchParams.get('imageId');
   const goToLast = searchParams.get('goToLast') === 'true';

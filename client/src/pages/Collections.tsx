@@ -41,8 +41,8 @@ type CardSize = 'mini' | 'tiny' | 'small' | 'medium' | 'large' | 'xlarge';
 const Collections: React.FC = () => {
   const navigate = useNavigate();
   
-  // Random navigation with Ctrl+Shift+R hotkey
-  const { handleRandom, isLoading: isRandomLoading } = useRandomNavigation();
+  // Random navigation (hotkey registered in Header only to avoid double-call)
+  const { handleRandom, isLoading: isRandomLoading } = useRandomNavigation(true, false);
   
   // Restore page and search from sessionStorage when returning to this screen
   const [page, setPage] = useState(() => {

@@ -3,6 +3,10 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { randomApi } from '../services/randomApi';
 import toast from 'react-hot-toast';
 
+// ✅ FIX: Global flag to ensure only ONE event listener is active
+// Prevents double-call when multiple components use the hook on the same page
+let globalHotkeyRegistered = false;
+
 /**
  * Custom hook for random collection navigation with hotkey support
  * 
@@ -14,9 +18,10 @@ import toast from 'react-hot-toast';
  * - From Image Viewer: Navigate to first image of random collection (stay in viewer)
  * 
  * @param enabled - Whether the hotkey should be active (default: true)
+ * @param registerHotkey - Whether to register global hotkey (default: true, set false for non-Header components)
  * @returns { handleRandom, isLoading }
  */
-export const useRandomNavigation = (enabled: boolean = true) => {
+export const useRandomNavigation = (enabled: boolean = true, registerHotkey: boolean = true) => {
   const navigate = useNavigate();
   const location = useLocation();
   const [isLoading, setIsLoading] = useState(false);
@@ -57,8 +62,18 @@ export const useRandomNavigation = (enabled: boolean = true) => {
   }, [navigate, location.pathname, isLoading]);
 
   // Keyboard shortcut: Ctrl+Shift+R for random
+  // ✅ FIX: Only register if requested AND not already registered globally
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || !registerHotkey) return;
+    
+    // ✅ FIX: Check global flag to prevent multiple registrations
+    if (globalHotkeyRegistered) {
+      console.log('[useRandomNavigation] Hotkey already registered globally, skipping');
+      return;
+    }
+
+    console.log('[useRandomNavigation] Registering global hotkey');
+    globalHotkeyRegistered = true;
 
     const handleKeyDown = (e: KeyboardEvent) => {
       // Ctrl+Shift+R or Cmd+Shift+R (Mac)
@@ -69,8 +84,13 @@ export const useRandomNavigation = (enabled: boolean = true) => {
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [enabled, handleRandom]);
+    
+    return () => {
+      console.log('[useRandomNavigation] Unregistering global hotkey');
+      window.removeEventListener('keydown', handleKeyDown);
+      globalHotkeyRegistered = false;
+    };
+  }, [enabled, registerHotkey, handleRandom]);
 
   return {
     handleRandom,
