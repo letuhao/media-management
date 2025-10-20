@@ -340,34 +340,19 @@ public class ImageProcessingConsumer : BaseMessageConsumer
             // Create embedded image using the new service
             var collectionId = ObjectId.Parse(imageMessage.CollectionId); // Convert string back to ObjectId
             
-            // Extract filename properly (handle archive entries)
-            string filename;
-            string relativePath;
-            
-            //// Use new DTO structure to avoid legacy string splitting bugs
-            //var archiveEntryInfo = ArchiveEntryInfo.FromPath(imageMessage.ImagePath);
-            //if (archiveEntryInfo != null)
-            //{
-            //    // This is an archive entry - extract the entry name
-            //    filename = Path.GetFileName(archiveEntryInfo.EntryName); // Just the entry filename
-            //    relativePath = archiveEntryInfo.EntryName; // Use entry path as relative path
-            //}
-            //else
-            //{
-            //    // Regular file
-            //    filename = Path.GetFileName(imageMessage.ImagePath);
-            //    relativePath = GetRelativePath(imageMessage.ImagePath, collectionId);
-            //}
+            // ✅ FIX: Extract filename properly from EntryName (which has full path)
+            var filename = Path.GetFileName(imageMessage.ArchiveEntry.EntryName);  // Just the filename
+            var relativePath = imageMessage.ArchiveEntry.EntryName;  // Full path inside archive
             
             var embeddedImage = await imageService.CreateEmbeddedImageAsync(
                 collectionId,
-                imageMessage.ArchiveEntry.EntryName,
-                imageMessage.ArchiveEntry.EntryName,
+                filename,  // ✅ FIX: Just filename, not full path
+                relativePath,  // ✅ Full path for uniqueness
                 fileSize,
                 width,
                 height,
                 imageMessage.ImageFormat,
-                imageMessage.ArchiveEntry
+                imageMessage.ArchiveEntry  // ✅ Pass complete ArchiveEntry
             );
             
             _logger.LogDebug("✅ Created embedded image {ImageId} for {Path}#{Entry}", embeddedImage.Id, imageMessage.ArchiveEntry.ArchivePath, imageMessage.ArchiveEntry.EntryName);

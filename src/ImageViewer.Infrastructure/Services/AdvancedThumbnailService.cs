@@ -15,17 +15,20 @@ public class AdvancedThumbnailService : IAdvancedThumbnailService
     private readonly ICollectionRepository _collectionRepository;
     private readonly IImageProcessingService _imageProcessingService;
     private readonly ICacheFolderRepository _cacheFolderRepository;
+    private readonly IImageProcessingSettingsService _imageProcessingSettingsService;
     private readonly ILogger<AdvancedThumbnailService> _logger;
 
     public AdvancedThumbnailService(
         ICollectionRepository collectionRepository,
         IImageProcessingService imageProcessingService,
         ICacheFolderRepository cacheFolderRepository,
+        IImageProcessingSettingsService imageProcessingSettingsService,
         ILogger<AdvancedThumbnailService> logger)
     {
         _collectionRepository = collectionRepository ?? throw new ArgumentNullException(nameof(collectionRepository));
         _imageProcessingService = imageProcessingService ?? throw new ArgumentNullException(nameof(imageProcessingService));
         _cacheFolderRepository = cacheFolderRepository ?? throw new ArgumentNullException(nameof(cacheFolderRepository));
+        _imageProcessingSettingsService = imageProcessingSettingsService ?? throw new ArgumentNullException(nameof(imageProcessingSettingsService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -87,11 +90,13 @@ public class AdvancedThumbnailService : IAdvancedThumbnailService
             var thumbnailPath = Path.Combine(thumbnailDir, $"{sourceImage.Id}_300x300.jpg");
 
             // Generate thumbnail using image processing service
+            // ✅ FIX: Reuse existing ArchiveEntry from source image
             var thumbnailData = await _imageProcessingService.GenerateThumbnailAsync(
-                new ArchiveEntryInfo()
+                sourceImage.ArchiveEntry ?? new ArchiveEntryInfo()
                 {
                     ArchivePath = collection.Path,
-                    EntryName = sourceImage.Filename,
+                    EntryName = sourceImage.RelativePath,  // ✅ Use RelativePath
+                    EntryPath = sourceImage.RelativePath,
                     IsDirectory = isDirectory
                 }, 300, 300, "jpeg", 95, cancellationToken);
 
@@ -104,15 +109,19 @@ public class AdvancedThumbnailService : IAdvancedThumbnailService
             // Save thumbnail to disk
             await File.WriteAllBytesAsync(thumbnailPath, thumbnailData, cancellationToken);
 
+            // ✅ FIX: Load quality from settings instead of hardcoding
+            var qualitySetting = await _imageProcessingSettingsService.GetThumbnailQualityAsync();
+            var thumbnailSize = await _imageProcessingSettingsService.GetThumbnailSizeAsync();
+
             // Create ThumbnailEmbedded and add to collection
             var thumbnail = new ThumbnailEmbedded(
                 sourceImage.Id,
                 thumbnailPath,
-                300,
-                300,
+                thumbnailSize,
+                thumbnailSize,
                 thumbnailData.Length,
                 "jpg",
-                95);
+                qualitySetting); // Load from settings
 
             collection.AddThumbnail(thumbnail);
             await _collectionRepository.UpdateAsync(collection);

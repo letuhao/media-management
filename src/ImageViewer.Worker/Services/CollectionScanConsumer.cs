@@ -165,11 +165,13 @@ public class CollectionScanConsumer : BaseMessageConsumer
                     try
                     {
                         // Extract basic metadata for the image processing message
+                        // Pass RelativePath to preserve folder structure inside archives
                         var archiveEntry = ArchiveEntryInfo.FromCollection(
                             collection.Path, 
                             collection.Type, 
                             mediaFile.FileName, 
-                            mediaFile.FileSize);
+                            mediaFile.FileSize,
+                            mediaFile.RelativePath); // ✅ FIX: Pass full relative path
 
                         var (width, height) = await ExtractImageDimensions(archiveEntry);
                         
@@ -426,30 +428,21 @@ public class CollectionScanConsumer : BaseMessageConsumer
             using var scope = _serviceScopeFactory.CreateScope();
             var imageProcessingService = scope.ServiceProvider.GetRequiredService<IImageProcessingService>();
             
-            // For ZIP files, we can't easily extract dimensions without extracting the file
-            if (!archiveEntry.IsDirectory)
+            // ✅ FIX: Extract dimensions for BOTH regular files and archive entries
+            var dimensions = await imageProcessingService.GetImageDimensionsAsync(archiveEntry);
+            if (dimensions != null && dimensions.Width > 0 && dimensions.Height > 0)
             {
-                _logger.LogDebug("📦 Archive entry detected, skipping dimension extraction for {Path}#{Entry}", archiveEntry.ArchivePath, archiveEntry.EntryName);
-                return (0, 0); // Will be extracted during image processing
+                _logger.LogDebug("📊 Extracted dimensions for {Path}#{Entry}: {Width}x{Height}", 
+                    archiveEntry.ArchivePath, archiveEntry.EntryName, dimensions.Width, dimensions.Height);
+                return (dimensions.Width, dimensions.Height);
             }
             
-            // For regular files, extract dimensions using IImageProcessingService
-            if (File.Exists(archiveEntry.GetPhysicalFileFullPath()))
-            {
-                var dimensions = await imageProcessingService.GetImageDimensionsAsync(archiveEntry);
-                if (dimensions != null && dimensions.Width > 0 && dimensions.Height > 0)
-                {
-                    _logger.LogDebug("📊 Extracted dimensions for {Path}: {Width}x{Height}", 
-                        archiveEntry.GetPhysicalFileFullPath(), dimensions.Width, dimensions.Height);
-                    return (dimensions.Width, dimensions.Height);
-                }
-            }
-            
-            return (0, 0); // Default to 0, will be determined during processing
+            return (0, 0); // Default to 0 if extraction fails
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "⚠️ Failed to extract dimensions for {Path}#{Entry}, will be determined during processing", archiveEntry.ArchivePath, archiveEntry.EntryName);
+            _logger.LogWarning(ex, "⚠️ Failed to extract dimensions for {Path}#{Entry}", 
+                archiveEntry.ArchivePath, archiveEntry.EntryName);
             return (0, 0);
         }
     }
@@ -484,17 +477,20 @@ public class CollectionScanConsumer : BaseMessageConsumer
                 try
                 {
                     // Extract image dimensions
+                    // ✅ FIX: Pass relativePath to preserve folder structure
                     var archiveEntry = ArchiveEntryInfo.FromCollection(
                         collection.Path, 
                         collection.Type, 
                         mediaFile.FileName, 
-                        mediaFile.FileSize);
+                        mediaFile.FileSize,
+                        mediaFile.RelativePath);
                     var (width, height) = await ExtractImageDimensions(archiveEntry);
                     
-                    // Create image embedded (no archiveEntry for directory files)
+                    // ✅ CRITICAL FIX: Pass archiveEntry to constructor!
                     var image = new ImageEmbedded(
                         filename: mediaFile.FileName,
                         relativePath: mediaFile.RelativePath,
+                        archiveEntry: archiveEntry,  // ✅ FIX: Was missing!
                         fileSize: mediaFile.FileSize,
                         width: width > 0 ? width : 0,
                         height: height > 0 ? height : 0,

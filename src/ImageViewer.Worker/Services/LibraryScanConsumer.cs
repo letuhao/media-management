@@ -70,6 +70,7 @@ public class LibraryScanConsumer : BaseMessageConsumer
                 var scheduledJobRunRepository = scope.ServiceProvider.GetRequiredService<IScheduledJobRunRepository>();
                 var messageQueueService = scope.ServiceProvider.GetRequiredService<IMessageQueueService>();
                 var bulkService = scope.ServiceProvider.GetRequiredService<IBulkService>();
+                var imageProcessingSettingsService = scope.ServiceProvider.GetService<IImageProcessingSettingsService>();
 
                 // Get the library
                 var libraryId = ObjectId.Parse(scanMessage.LibraryId);
@@ -123,6 +124,24 @@ public class LibraryScanConsumer : BaseMessageConsumer
 
                 _logger.LogInformation("🔍 Scanning library folder: {Path}", library.Path);
                 
+                // ✅ Load thumbnail size from system settings (not library settings)
+                int thumbnailWidth = 300;  // Default fallback
+                int thumbnailHeight = 300; // Default fallback
+                
+                if (imageProcessingSettingsService != null)
+                {
+                    try
+                    {
+                        thumbnailWidth = await imageProcessingSettingsService.GetThumbnailSizeAsync();
+                        thumbnailHeight = thumbnailWidth; // Use same size for width and height
+                        _logger.LogDebug("📐 Loaded thumbnail size from system settings: {Size}x{Size}", thumbnailWidth, thumbnailHeight);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to load thumbnail size from system settings, using default 300x300");
+                    }
+                }
+                
                 // Use BulkService to discover and create collections
                 // BulkService has tested logic for nested folders, compressed files, etc.
                 var bulkRequest = new BulkAddCollectionsRequest
@@ -137,8 +156,8 @@ public class LibraryScanConsumer : BaseMessageConsumer
                     UseDirectFileAccess = scanMessage.UseDirectFileAccess, // Pass direct mode flag
                     AutoScan = library.Settings?.AutoScan ?? false,
                     EnableCache = library.Settings?.CacheSettings?.Enabled ?? true,
-                    ThumbnailWidth = library.Settings?.ThumbnailSettings?.Width,
-                    ThumbnailHeight = library.Settings?.ThumbnailSettings?.Height
+                    ThumbnailWidth = thumbnailWidth,  // ✅ Use system settings
+                    ThumbnailHeight = thumbnailHeight // ✅ Use system settings
                 };
 
                 var result = await bulkService.BulkAddCollectionsAsync(bulkRequest, CancellationToken.None);

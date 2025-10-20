@@ -235,7 +235,7 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
             try
             {
                 // Skip if already exists
-                if (await ThumbnailAlreadyExistsAsync(collectionRepository, message, collectionObjectId))
+                if (await ThumbnailAlreadyExistsAsync(collectionRepository, message, collectionObjectId, settingsService))
                 {
                     _logger.LogDebug("⏭️ Thumbnail already exists for image {ImageId}, skipping", message.ImageId);
                     continue;
@@ -283,7 +283,7 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
         _logger.LogInformation("📝 Updating database for collection {CollectionId} with {Count} thumbnails", 
             collectionId, thumbnailPaths.Count);
         
-        await UpdateDatabaseAtomicallyAsync(collectionRepository, collectionObjectId, thumbnailPaths, messages);
+        await UpdateDatabaseAtomicallyAsync(collectionRepository, collectionObjectId, thumbnailPaths, messages, settingsService);
         
         // Step 4: Update job progress and statistics
         await UpdateJobProgressAsync(serviceProvider, messages, processedImages, failedImages);
@@ -410,7 +410,8 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
         ICollectionRepository collectionRepository,
         ObjectId collectionId,
         List<ThumbnailPathData> thumbnailPaths,
-        List<ThumbnailGenerationMessage> originalMessages)
+        List<ThumbnailGenerationMessage> originalMessages,
+        IImageProcessingSettingsService settingsService)
     {
         try
         {
@@ -424,6 +425,9 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
             // Create thumbnail embedded objects
             var thumbnailsToAdd = new List<ThumbnailEmbedded>();
             
+            // ✅ FIX: Load quality from settings instead of hardcoding 95
+            var qualitySetting = await settingsService.GetThumbnailQualityAsync();
+            
             foreach (var thumbnailPath in thumbnailPaths)
             {
                 var originalMessage = originalMessages.FirstOrDefault(m => m.ImageId == thumbnailPath.ImageId);
@@ -436,7 +440,7 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
                         originalMessage.ThumbnailHeight,
                         thumbnailPath.Size,
                         Path.GetExtension(thumbnailPath.ThumbnailPath).TrimStart('.').ToUpperInvariant(),
-                        95 // quality
+                        qualitySetting // Load from settings
                     );
                     
                     thumbnailsToAdd.Add(thumbnailEmbedded);
@@ -459,7 +463,8 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
     private async Task<bool> ThumbnailAlreadyExistsAsync(
         ICollectionRepository collectionRepository,
         ThumbnailGenerationMessage message,
-        ObjectId collectionId)
+        ObjectId collectionId,
+        IImageProcessingSettingsService settingsService)
     {
         try
         {
@@ -493,6 +498,9 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
                     
                     // Re-add the existing thumbnail file to collection
                     var fileInfo = new FileInfo(thumbnailPath);
+                    // ✅ FIX: Load quality from settings instead of hardcoding 95
+                    var qualitySetting = await settingsService.GetThumbnailQualityAsync();
+                    
                     var thumbnailEmbedded = new ThumbnailEmbedded(
                         message.ImageId,
                         thumbnailPath,
@@ -500,7 +508,7 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
                         message.ThumbnailHeight,
                         fileInfo.Length,
                         fileInfo.Extension.TrimStart('.').ToUpperInvariant(),
-                        95 // quality
+                        qualitySetting // Load from settings
                     );
                     
                     await collectionRepository.AtomicAddThumbnailAsync(collectionId, thumbnailEmbedded);

@@ -54,6 +54,17 @@ const Collections: React.FC = () => {
     return sessionStorage.getItem('collectionsSearchQuery') || '';
   });
   
+  // Debounced search for API - only send after user stops typing
+  const [debouncedSearch, setDebouncedSearch] = useState(search);
+  
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search);
+    }, 300); // Wait 300ms after user stops typing
+    
+    return () => clearTimeout(timer);
+  }, [search]);
+  
   // Get user settings from backend
   const { data: userSettingsData } = useUserSettings();
   const updateSettingsMutation = useUpdateUserSettings();
@@ -103,7 +114,9 @@ const Collections: React.FC = () => {
     pageNumbersToShow: userSettingsData?.pagination?.pageNumbersToShow ?? 5,
   };
 
-  const { data, isLoading, refetch} = useCollections({ page, limit, sortBy, sortDirection });
+  // Pass debounced search to API - server-side search instead of client-side filtering
+  const searchParams = debouncedSearch ? { page, limit, sortBy, sortDirection, search: debouncedSearch } : { page, limit, sortBy, sortDirection };
+  const { data, isLoading, refetch} = useCollections(searchParams);
   
   // Preserve previous pagination data to prevent layout shift during loading
   const [previousTotalPages, setPreviousTotalPages] = useState(1);
@@ -120,6 +133,11 @@ const Collections: React.FC = () => {
       setPreviousTotalCount(data.total);
     }
   }, [data?.total]);
+
+  // Reset to page 1 when debounced search changes
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch]);
 
   // Save current page to sessionStorage whenever it changes
   useEffect(() => {
@@ -185,11 +203,8 @@ const Collections: React.FC = () => {
     };
   }, []);
 
-  // Filter collections by search query
-  const filteredCollections = data?.data?.filter((collection) =>
-    collection.name.toLowerCase().includes(search.toLowerCase()) ||
-    collection.path.toLowerCase().includes(search.toLowerCase())
-  ) ?? [];
+  // Server-side search now! No client-side filtering needed
+  const filteredCollections = data?.data ?? [];
 
   // Save preferences to localStorage
   const saveViewMode = useCallback((mode: ViewMode) => {

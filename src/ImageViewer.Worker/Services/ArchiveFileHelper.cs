@@ -42,14 +42,33 @@ public static class ArchiveFileHelper
 
             // Use SharpCompress to support multiple archive formats
             using var archive = ArchiveFactory.Open(archiveEntry.ArchivePath);
+            
+            // Try exact match first (correct path with folders)
             var entry = archive.Entries.FirstOrDefault(e => 
                 !e.IsDirectory && 
                 MacOSXFilterHelper.IsSafeToProcess(e.Key, "archive entry extraction") &&
                 (e.Key == archiveEntry.EntryName || e.Key.Replace('\\', '/') == archiveEntry.EntryName.Replace('\\', '/')));
             
+            // ✅ FALLBACK: If not found, try matching by filename only (for corrupted data)
             if (entry == null)
             {
-                logger?.LogWarning("Entry {Entry} not found in archive {Archive}", archiveEntry.EntryName, archiveEntry.ArchivePath);
+                var filename = Path.GetFileName(archiveEntry.EntryName);
+                entry = archive.Entries.FirstOrDefault(e => 
+                    !e.IsDirectory && 
+                    MacOSXFilterHelper.IsSafeToProcess(e.Key, "archive entry extraction") &&
+                    Path.GetFileName(e.Key).Equals(filename, StringComparison.OrdinalIgnoreCase));
+                
+                if (entry != null)
+                {
+                    logger?.LogWarning("⚠️ Entry found by filename fallback: EntryName='{Wrong}' matched by filename to '{Correct}'", 
+                        archiveEntry.EntryName, entry.Key);
+                }
+            }
+            
+            if (entry == null)
+            {
+                logger?.LogWarning("❌ Entry {Entry} not found in archive {Archive} (tried exact match and filename fallback)", 
+                    archiveEntry.EntryName, archiveEntry.ArchivePath);
                 return null;
             }
 
@@ -108,14 +127,33 @@ public static class ArchiveFileHelper
 
             // Use SharpCompress to get entry metadata without extraction
             using var archive = ArchiveFactory.Open(archiveEntry.ArchivePath);
+            
+            // Try exact match first
             var entry = archive.Entries.FirstOrDefault(e => 
                 !e.IsDirectory && 
                 MacOSXFilterHelper.IsSafeToProcess(e.Key, "archive entry size check") &&
                 (e.Key == archiveEntry.EntryName || e.Key.Replace('\\', '/') == archiveEntry.EntryName.Replace('\\', '/')));
             
+            // ✅ FALLBACK: Try matching by filename only (for corrupted data)
             if (entry == null)
             {
-                logger?.LogWarning("Entry {Entry} not found in archive {Archive}", archiveEntry.EntryName, archiveEntry.ArchivePath);
+                var filename = Path.GetFileName(archiveEntry.EntryName);
+                entry = archive.Entries.FirstOrDefault(e => 
+                    !e.IsDirectory && 
+                    MacOSXFilterHelper.IsSafeToProcess(e.Key, "archive entry size check") &&
+                    Path.GetFileName(e.Key).Equals(filename, StringComparison.OrdinalIgnoreCase));
+                
+                if (entry != null)
+                {
+                    logger?.LogWarning("⚠️ Entry found by filename fallback for size check: '{Wrong}' → '{Correct}'", 
+                        archiveEntry.EntryName, entry.Key);
+                }
+            }
+            
+            if (entry == null)
+            {
+                logger?.LogWarning("❌ Entry {Entry} not found in archive {Archive}", 
+                    archiveEntry.EntryName, archiveEntry.ArchivePath);
                 return 0;
             }
 

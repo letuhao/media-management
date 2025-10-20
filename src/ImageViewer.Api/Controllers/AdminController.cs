@@ -145,10 +145,13 @@ public class AdminController : ControllerBase
                 DryRun = request.DryRun
             };
             
+            // Use CancellationToken.None instead of HttpContext.RequestAborted
+            // because this is a long-running operation that should complete 
+            // even after the HTTP response is sent
             var stats = await _collectionIndexService.RebuildIndexAsync(
                 request.Mode,
                 options,
-                HttpContext.RequestAborted);
+                CancellationToken.None);
             
             return Ok(stats);
         }
@@ -172,9 +175,10 @@ public class AdminController : ControllerBase
         {
             _logger.LogInformation("Admin triggered index verification: DryRun={DryRun}", request.DryRun);
             
+            // Use CancellationToken.None for long-running operations
             var result = await _collectionIndexService.VerifyIndexAsync(
                 request.DryRun,
-                HttpContext.RequestAborted);
+                CancellationToken.None);
             
             return Ok(result);
         }
@@ -254,6 +258,38 @@ public class AdminController : ControllerBase
             return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }
+    
+    /// <summary>
+    /// Fix archive entry paths for collections with incorrect folder structure
+    /// This repairs the bug where entry paths don't include folder structure inside archives
+    /// </summary>
+    [HttpPost("fix-archive-entries")]
+    [ProducesResponseType(typeof(ArchiveEntryFixResult), 200)]
+    [ProducesResponseType(400)]
+    [ProducesResponseType(500)]
+    public async Task<IActionResult> FixArchiveEntries([FromBody] FixArchiveEntriesRequest request)
+    {
+        try
+        {
+            _logger.LogInformation("Admin triggered archive entry fix: DryRun={DryRun}, Limit={Limit}, CollectionId={CollectionId}, FixMode={FixMode}, OnlyCorrupted={OnlyCorrupted}",
+                request.DryRun, request.Limit, request.CollectionId ?? "null", request.FixMode ?? "All", request.OnlyCorrupted);
+
+            var result = await _collectionIndexService.FixArchiveEntryPathsAsync(
+                request.DryRun,
+                request.Limit,
+                request.CollectionId,
+                request.FixMode,
+                request.OnlyCorrupted,
+                CancellationToken.None);
+
+            return Ok(result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Failed to fix archive entries");
+            return StatusCode(500, new { message = "Failed to fix archive entries", error = ex.Message });
+        }
+    }
 }
 
 /// <summary>
@@ -272,4 +308,16 @@ public class RebuildIndexRequest
 public class VerifyIndexRequest
 {
     public bool DryRun { get; set; } = true;
+}
+
+/// <summary>
+/// Request for fixing archive entries
+/// </summary>
+public class FixArchiveEntriesRequest
+{
+    public bool DryRun { get; set; } = true;
+    public int? Limit { get; set; } = null; // Limit number of collections to process
+    public string? CollectionId { get; set; } = null; // Fix specific collection by ID (for debugging)
+    public string? FixMode { get; set; } = null; // "All", "DimensionsOnly", "PathsOnly"
+    public bool OnlyCorrupted { get; set; } = false; // If true, only process collections with dimension issues
 }

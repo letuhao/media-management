@@ -48,14 +48,33 @@ public static class ZipFileHelper
 
             // Use SharpCompress to support multiple archive formats
             using var archive = ArchiveFactory.Open(archivePath);
+            
+            // Try exact match first (correct path with folders)
             var entry = archive.Entries.FirstOrDefault(e => 
                 !e.IsDirectory && 
                 MacOSXFilterHelper.IsSafeToProcess(e.Key, "archive entry lookup") &&
                 (e.Key == entryName || e.Key.Replace('\\', '/') == entryName.Replace('\\', '/')));
             
+            // ✅ FALLBACK: Try matching by filename only (for corrupted data)
             if (entry == null)
             {
-                logger?.LogWarning("Entry {Entry} not found in archive {Archive}", entryName, archivePath);
+                var filename = Path.GetFileName(entryName);
+                entry = archive.Entries.FirstOrDefault(e => 
+                    !e.IsDirectory && 
+                    MacOSXFilterHelper.IsSafeToProcess(e.Key, "archive entry lookup") &&
+                    Path.GetFileName(e.Key).Equals(filename, StringComparison.OrdinalIgnoreCase));
+                
+                if (entry != null)
+                {
+                    logger?.LogWarning("⚠️ Entry found by filename fallback: EntryName='{Wrong}' matched to '{Correct}'", 
+                        entryName, entry.Key);
+                }
+            }
+            
+            if (entry == null)
+            {
+                logger?.LogWarning("❌ Entry {Entry} not found in archive {Archive} (tried exact match and filename fallback)", 
+                    entryName, archivePath);
                 return null;
             }
 

@@ -44,6 +44,18 @@ public interface ICollectionIndexService
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Fix archive entry paths for collections with incorrect folder structure.
+    /// Scans archive collections and corrects entryName/entryPath to include folder structure.
+    /// </summary>
+    Task<ArchiveEntryFixResult> FixArchiveEntryPathsAsync(
+        bool dryRun = true,
+        int? limit = null,
+        string? collectionId = null,
+        string? fixMode = null,
+        bool onlyCorrupted = false,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Add or update a single collection in the index.
     /// Called when collection is created or updated.
     /// </summary>
@@ -92,6 +104,18 @@ public interface ICollectionIndexService
     /// Uses Redis sorted set ZRANGE for fast pagination.
     /// </summary>
     Task<CollectionPageResult> GetCollectionPageAsync(
+        int page,
+        int pageSize,
+        string sortBy = "updatedAt",
+        string sortDirection = "desc",
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Search collections by name/path with pagination and sorting.
+    /// Searches ALL collections (not just current page) then applies sorting and pagination.
+    /// </summary>
+    Task<CollectionPageResult> SearchCollectionPageAsync(
+        string searchQuery,
         int page,
         int pageSize,
         string sortBy = "updatedAt",
@@ -264,6 +288,22 @@ public class CollectionIndexStats
     public DateTime? LastRebuildTime { get; set; }
     public bool IsValid { get; set; }
     public Dictionary<string, int> SortedSetSizes { get; set; } = new();
+}
+
+/// <summary>
+/// Archive entry fix result
+/// </summary>
+public class ArchiveEntryFixResult
+{
+    public int TotalCollectionsScanned { get; set; }
+    public int CollectionsWithIssues { get; set; }
+    public int ImagesFixed { get; set; }
+    public List<string> FixedCollectionIds { get; set; } = new();
+    public List<string> ErrorMessages { get; set; } = new();
+    public TimeSpan Duration { get; set; }
+    public bool DryRun { get; set; }
+    public DateTime StartedAt { get; set; }
+    public DateTime CompletedAt { get; set; }
 }
 
 /// <summary>

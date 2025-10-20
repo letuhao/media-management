@@ -214,6 +214,9 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                         
                         // Thumbnail file exists on disk but not in collection - add the entry
                         var fileInfo = new FileInfo(thumbnailPath);
+                        // ✅ FIX: Load quality from settings instead of hardcoding 95
+                        var qualitySetting = await settingsService.GetThumbnailQualityAsync();
+                        
                         var thumbnailEmbedded = new ThumbnailEmbedded(
                             thumbnailMessage.ImageId,
                             thumbnailPath,
@@ -221,7 +224,7 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                             thumbnailMessage.ThumbnailHeight,
                             fileInfo.Length,
                             fileInfo.Extension.TrimStart('.').ToUpperInvariant(),
-                            95 // quality
+                            qualitySetting // Load from settings
                         );
                         
                         await collectionRepository.AtomicAddThumbnailAsync(collectionId, thumbnailEmbedded);
@@ -278,7 +281,7 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                 if (!string.IsNullOrEmpty(thumbnailPath))
                 {
                     // Update database with thumbnail information
-                    await UpdateThumbnailInfoInDatabase(thumbnailMessage, thumbnailPath, collectionRepository);
+                    await UpdateThumbnailInfoInDatabase(thumbnailMessage, thumbnailPath, collectionRepository, settingsService);
                     
                     // REAL-TIME JOB TRACKING: Update job stage immediately after each thumbnail
                     if (!string.IsNullOrEmpty(thumbnailMessage.ScanJobId))
@@ -606,7 +609,7 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
         return Path.Combine(thumbnailDir, thumbnailFileName);
     }
 
-    private async Task UpdateThumbnailInfoInDatabase(ThumbnailGenerationMessage thumbnailMessage, string thumbnailPath, ICollectionRepository collectionRepository)
+    private async Task UpdateThumbnailInfoInDatabase(ThumbnailGenerationMessage thumbnailMessage, string thumbnailPath, ICollectionRepository collectionRepository, IImageProcessingSettingsService settingsService)
     {
         try
         {
@@ -624,6 +627,9 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
             
             // Create thumbnail embedded object
             var fileInfo = new FileInfo(thumbnailPath);
+            // ✅ FIX: Load quality from settings instead of hardcoding 95
+            var qualitySetting = await settingsService.GetThumbnailQualityAsync();
+            
             var thumbnailEmbedded = new ThumbnailEmbedded(
                 thumbnailMessage.ImageId,
                 thumbnailPath,
@@ -631,7 +637,7 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                 thumbnailMessage.ThumbnailHeight,
                 fileInfo.Length,
                 fileInfo.Extension.TrimStart('.').ToUpperInvariant(),
-                95 // quality
+                qualitySetting // Load from settings
             );
             
             // Atomically add thumbnail to collection (thread-safe, prevents race conditions!)

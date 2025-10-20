@@ -15,6 +15,7 @@ public class ImageService : IImageService
     private readonly ICollectionRepository _collectionRepository;
     private readonly IImageProcessingService _imageProcessingService;
     private readonly ICacheService _cacheService;
+    private readonly IImageProcessingSettingsService _imageProcessingSettingsService;
     private readonly ILogger<ImageService> _logger;
     private readonly ImageSizeOptions _sizeOptions;
     private readonly ICollectionService _collectionService;
@@ -23,6 +24,7 @@ public class ImageService : IImageService
         ICollectionRepository collectionRepository,
         IImageProcessingService imageProcessingService,
         ICacheService cacheService,
+        IImageProcessingSettingsService imageProcessingSettingsService,
         ILogger<ImageService> logger,
         IOptions<ImageSizeOptions> sizeOptions,
         ICollectionService collectionService)
@@ -31,6 +33,7 @@ public class ImageService : IImageService
         _collectionService = collectionService ?? throw new ArgumentNullException(nameof(collectionService));
         _imageProcessingService = imageProcessingService ?? throw new ArgumentNullException(nameof(imageProcessingService));
         _cacheService = cacheService ?? throw new ArgumentNullException(nameof(cacheService));
+        _imageProcessingSettingsService = imageProcessingSettingsService ?? throw new ArgumentNullException(nameof(imageProcessingSettingsService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _sizeOptions = sizeOptions?.Value ?? new ImageSizeOptions();
     }
@@ -475,10 +478,12 @@ public class ImageService : IImageService
             }
 
             //var fullPath = image.GetFullPath(collection.Path);
-            var archiveEntry = new ArchiveEntryInfo()
+            // ✅ FIX: Reuse existing ArchiveEntry from image instead of recreating
+            var archiveEntry = image.ArchiveEntry ?? new ArchiveEntryInfo()
             {
                 ArchivePath = collection.Path,
-                EntryName = image.Filename,
+                EntryName = image.RelativePath,  // ✅ Use RelativePath (has full path)
+                EntryPath = image.RelativePath,
                 IsDirectory = Directory.Exists(collection.Path),
             };
             
@@ -800,12 +805,16 @@ public class ImageService : IImageService
                 throw new InvalidOperationException($"Archive entry thumbnail generation should be handled by ThumbnailGenerationConsumer, not ImageService: {fullImagePath}");
             }
             
-            var thumbnailData = await _imageProcessingService.GenerateThumbnailAsync(new ArchiveEntryInfo() 
-            {
-                ArchivePath = collection.Path,
-                EntryName = image.Filename,
-                IsDirectory = !isArchiveEntry,
-            }, width, height, "jpeg", 95, cancellationToken);
+            // ✅ FIX: Reuse existing ArchiveEntry from image
+            var thumbnailData = await _imageProcessingService.GenerateThumbnailAsync(
+                image.ArchiveEntry ?? new ArchiveEntryInfo() 
+                {
+                    ArchivePath = collection.Path,
+                    EntryName = image.RelativePath,  // ✅ Use RelativePath
+                    EntryPath = image.RelativePath,
+                    IsDirectory = !isArchiveEntry,
+                }, 
+                width, height, "jpeg", 95, cancellationToken);
             
             // Determine thumbnail path using cache service
             var cacheFolders = await _cacheService.GetCacheFoldersAsync();
@@ -833,8 +842,11 @@ public class ImageService : IImageService
             // Save thumbnail file
             await File.WriteAllBytesAsync(thumbnailPath, thumbnailData, cancellationToken);
             
+            // ✅ FIX: Load quality from settings instead of hardcoding 95
+            var qualitySetting = await _imageProcessingSettingsService.GetThumbnailQualityAsync();
+            
             // Create thumbnail info
-            var thumbnailInfo = new ThumbnailEmbedded(imageId, thumbnailPath, width, height, thumbnailData.Length, Path.GetExtension(image.Filename), 95);
+            var thumbnailInfo = new ThumbnailEmbedded(imageId, thumbnailPath, width, height, thumbnailData.Length, Path.GetExtension(image.Filename), qualitySetting);
             
             // Add thumbnail to collection
             collection.AddThumbnail(thumbnailInfo);
@@ -897,12 +909,16 @@ public class ImageService : IImageService
             }
             else
             {
-                cacheData = await _imageProcessingService.ResizeImageAsync(new ArchiveEntryInfo()
-                {
-                    ArchivePath = collection.Path,
-                    EntryName = image.Filename,
-                    IsDirectory = !isArchiveEntry,
-                }, width, height, "jpeg", 95, cancellationToken);
+                // ✅ FIX: Reuse existing ArchiveEntry from image
+                cacheData = await _imageProcessingService.ResizeImageAsync(
+                    image.ArchiveEntry ?? new ArchiveEntryInfo()
+                    {
+                        ArchivePath = collection.Path,
+                        EntryName = image.RelativePath,  // ✅ Use RelativePath
+                        EntryPath = image.RelativePath,
+                        IsDirectory = !isArchiveEntry,
+                    }, 
+                    width, height, "jpeg", 95, cancellationToken);
             }
             
             // Determine cache path using cache service

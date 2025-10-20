@@ -2,6 +2,9 @@ using Microsoft.Extensions.Logging;
 using SkiaSharp;
 using ImageViewer.Domain.Interfaces;
 using ImageViewer.Domain.ValueObjects;
+using ImageViewer.Domain.Enums;
+using SharpCompress.Archives;
+using ImageViewer.Application.Helpers;
 
 namespace ImageViewer.Infrastructure.Services;
 
@@ -322,24 +325,74 @@ public class SkiaSharpImageProcessingService : IImageProcessingService
         return Task.FromResult(new[] { "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff" });
     }
 
-    public Task<ImageDimensions> GetImageDimensionsAsync(ArchiveEntryInfo archiveEntry, CancellationToken cancellationToken = default)
+    public async Task<ImageDimensions> GetImageDimensionsAsync(ArchiveEntryInfo archiveEntry, CancellationToken cancellationToken = default)
     {
         try
         {
-            _logger.LogDebug("Getting dimensions for {ImagePath}", archiveEntry.GetPhysicalFileFullPath());
+            _logger.LogDebug("Getting dimensions for {ImagePath}", archiveEntry.GetDisplayPath());
 
-            using var stream = File.OpenRead(archiveEntry.GetPhysicalFileFullPath());
-            using var codec = SKCodec.Create(stream);
+            byte[] imageBytes;
+            
+            // ✅ Handle archive entries using SharpCompress (same logic as ArchiveFileHelper)
+            if (archiveEntry.FileType == ImageFileType.ArchiveEntry)
+            {
+                if (!File.Exists(archiveEntry.ArchivePath))
+                {
+                    throw new FileNotFoundException($"Archive not found: {archiveEntry.ArchivePath}");
+                }
+
+                using var archive = ArchiveFactory.Open(archiveEntry.ArchivePath);
+                
+                // Try exact match
+                var entry = archive.Entries.FirstOrDefault(e => 
+                    !e.IsDirectory && 
+                    MacOSXFilterHelper.IsSafeToProcess(e.Key, "dimension extraction") &&
+                    (e.Key == archiveEntry.EntryName || e.Key.Replace('\\', '/') == archiveEntry.EntryName.Replace('\\', '/')));
+                
+                // Fallback: filename only
+                if (entry == null)
+                {
+                    var filename = Path.GetFileName(archiveEntry.EntryName);
+                    entry = archive.Entries.FirstOrDefault(e => 
+                        !e.IsDirectory && 
+                        MacOSXFilterHelper.IsSafeToProcess(e.Key, "dimension extraction") &&
+                        Path.GetFileName(e.Key).Equals(filename, StringComparison.OrdinalIgnoreCase));
+                }
+                
+                if (entry == null)
+                {
+                    throw new FileNotFoundException($"Entry {archiveEntry.EntryName} not found in {archiveEntry.ArchivePath}");
+                }
+
+                using var entryStream = entry.OpenEntryStream();
+                using var memoryStream = new MemoryStream();
+                await entryStream.CopyToAsync(memoryStream, cancellationToken);
+                imageBytes = memoryStream.ToArray();
+            }
+            else
+            {
+                // For regular files
+                imageBytes = await File.ReadAllBytesAsync(archiveEntry.GetPhysicalFileFullPath(), cancellationToken);
+            }
+
+            // Create codec from bytes
+            using var data = SKData.CreateCopy(imageBytes);
+            using var codec = SKCodec.Create(data);
+            
+            if (codec == null)
+            {
+                throw new InvalidOperationException($"Failed to create codec for {archiveEntry.GetDisplayPath()}");
+            }
             
             var info = codec.Info;
             var dimensions = new ImageDimensions(info.Width, info.Height);
             
-            _logger.LogDebug("Image {ImagePath} dimensions: {Width}x{Height}", archiveEntry.GetPhysicalFileFullPath(), dimensions.Width, dimensions.Height);
-            return Task.FromResult(dimensions);
+            _logger.LogDebug("Image {ImagePath} dimensions: {Width}x{Height}", archiveEntry.GetDisplayPath(), dimensions.Width, dimensions.Height);
+            return dimensions;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error getting dimensions for {ImagePath}", archiveEntry.GetPhysicalFileFullPath());
+            _logger.LogError(ex, "Error getting dimensions for {ImagePath}", archiveEntry.GetDisplayPath());
             throw;
         }
     }

@@ -154,11 +154,13 @@ public class AnimatedCacheRepairService : IAnimatedCacheRepairService
                     {
                         ImageId = incorrectFile.ImageId,
                         CollectionId = incorrectFile.CollectionId.ToString(),
-                        ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                        // ✅ FIX: Reuse existing ArchiveEntry from image
+                        ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                             collection.Path,
                             collection.Type,
                             image.Filename,
-                            image.FileSize),
+                            image.FileSize,
+                            image.RelativePath),
                         ForceRegenerate = forceRegenerate,
                         CacheWidth = 1920,  // Use default cache size
                         CacheHeight = 1080,
@@ -221,11 +223,13 @@ public class AnimatedCacheRepairService : IAnimatedCacheRepairService
                         {
                             ImageId = image.Id,
                             CollectionId = collection.Id.ToString(),
-                            ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                            // ✅ FIX: Reuse existing ArchiveEntry from image
+                            ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                                 collection.Path,
                                 collection.Type,
                                 image.Filename,
-                                image.FileSize),
+                                image.FileSize,
+                                image.RelativePath),
                             ForceRegenerate = true, // Force regeneration
                             CacheWidth = 1920,
                             CacheHeight = 1080,

@@ -176,9 +176,10 @@ public class ArchiveEntryInfo
     /// <param name="collectionType">Type of the collection (Folder or Archive)</param>
     /// <param name="fileName">Name of the file</param>
     /// <param name="fileSize">Size of the file (optional)</param>
+    /// <param name="relativePath">Full relative path inside archive (optional, defaults to fileName)</param>
     /// <returns>ArchiveEntryInfo configured based on collection type</returns>
     public static ArchiveEntryInfo FromCollection(string collectionPath, CollectionType collectionType, 
-        string fileName, long fileSize = 0)
+        string fileName, long fileSize = 0, string? relativePath = null)
     {
         if (collectionType == CollectionType.Folder)
         {
@@ -188,7 +189,9 @@ public class ArchiveEntryInfo
         else
         {
             // Entry inside an archive collection
-            return ForArchiveEntry(collectionPath, fileName, fileName, 0, fileSize);
+            // Use relativePath if provided (includes folder structure), otherwise fallback to fileName
+            var entryPath = relativePath ?? fileName;
+            return ForArchiveEntry(collectionPath, entryPath, entryPath, 0, fileSize);
         }
     }
 

@@ -676,11 +676,13 @@ public class BulkService : IBulkService
                     CollectionId = collection.Id.ToString(),
                     //ImagePath = imagePath,
                     //ImageFilename = image.Filename,
-                    ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                    // ✅ FIX: Reuse existing ArchiveEntry from image
+                    ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                         collection.Path, 
                         collection.Type, 
                         image.Filename, 
-                        image.FileSize),
+                        image.FileSize,
+                        image.RelativePath),
                     ThumbnailWidth = request.ThumbnailWidth ?? 300,
                     ThumbnailHeight = request.ThumbnailHeight ?? 300,
                     JobId = resumeJob.JobId.ToString(),
@@ -703,11 +705,13 @@ public class BulkService : IBulkService
                     ImageId = image.Id,
                     CollectionId = collection.Id.ToString(),
                     //ImagePath = imagePath,
-                    ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                    // ✅ FIX: Reuse existing ArchiveEntry from image
+                    ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                         collection.Path, 
                         collection.Type, 
                         image.Filename, 
-                        image.FileSize),
+                        image.FileSize,
+                        image.RelativePath),
                     CacheWidth = request.CacheWidth ?? 1920,
                     CacheHeight = request.CacheHeight ?? 1080,
                     Quality = cacheQuality, // Use loaded quality setting

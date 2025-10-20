@@ -2,8 +2,10 @@ using System.Text.Json;
 using ImageViewer.Application.Mappings;
 using ImageViewer.Application.Services;
 using ImageViewer.Domain.Entities;
+using ImageViewer.Domain.Enums;
 using ImageViewer.Domain.Interfaces;
 using ImageViewer.Domain.ValueObjects;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using MongoDB.Bson;
 using StackExchange.Redis;
@@ -160,10 +162,8 @@ public class RedisCollectionIndexService : ICollectionIndexService
 
                 var collectionList = batchCollections.ToList();
                 
-                // Process batch
-                var batch = _db.CreateBatch();
-                var tasks = new List<Task>();
-
+                // Process collections sequentially (no batch due to async I/O operations)
+                // Using batch with async file I/O causes deadlock
                 foreach (var collection in collectionList)
                 {
                     if (cancellationToken.IsCancellationRequested)
@@ -172,21 +172,21 @@ public class RedisCollectionIndexService : ICollectionIndexService
                         return;
                     }
 
-                    // Add to sorted sets (one per sort field/direction combination)
-                    tasks.Add(AddToSortedSetsAsync(batch, collection));
-
-                    // Add summary to hash
-                    tasks.Add(AddToHashAsync(batch, collection));
-                    
-                    // ✅ NEW: Update state tracking
-                    tasks.Add(UpdateCollectionIndexStateAsync(batch, collection));
+                    try
+                    {
+                        // Process each collection with direct database operations (not batched)
+                        await AddToSortedSetsAsync(_db, collection);
+                        await AddToHashAsync(_db, collection);
+                        await UpdateCollectionIndexStateAsync(_db, collection);
                     
                     processedCount++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to index collection {CollectionId}, skipping", collection.Id);
+                        // Continue with next collection
+                    }
                 }
-
-                // Execute batch
-                batch.Execute();
-                await Task.WhenAll(tasks);
 
                 // Memory monitoring after batch
                 var memoryAfter = GC.GetTotalMemory(false);
@@ -196,9 +196,6 @@ public class RedisCollectionIndexService : ICollectionIndexService
                 _logger.LogInformation("✅ Batch {Current}/{Total} completed: {Count} collections in {Duration}ms, Memory delta = {DeltaMB:+0.00;-0.00} MB (now {CurrentMB:F2} MB)", 
                     currentBatch, totalBatches, collectionList.Count, batchDuration.TotalMilliseconds,
                     memoryDelta / 1024.0 / 1024.0, memoryAfter / 1024.0 / 1024.0);
-
-                // ✅ CRITICAL: Clear tasks list to release memory held by completed tasks
-                tasks.Clear();
                 
                 // Force GC after each batch to free memory immediately
                 collectionList.Clear();
@@ -668,11 +665,44 @@ public class RedisCollectionIndexService : ICollectionIndexService
         {
             "updatedat" => collection.UpdatedAt.Ticks * multiplier,
             "createdat" => collection.CreatedAt.Ticks * multiplier,
-            "name" => (collection.Name?.GetHashCode() ?? 0) * multiplier,
+            "name" => GetNameScore(collection.Name) * multiplier,
             "imagecount" => collection.Statistics.TotalItems * multiplier,
             "totalsize" => collection.Statistics.TotalSize * multiplier,
             _ => collection.UpdatedAt.Ticks * multiplier
         };
+    }
+    
+    /// <summary>
+    /// Convert collection name to a score that preserves alphabetical order.
+    /// Uses first 10 characters (case-insensitive) to create sortable numeric score.
+    /// </summary>
+    private double GetNameScore(string? name)
+    {
+        if (string.IsNullOrEmpty(name))
+            return 0;
+            
+        // Normalize: lowercase and trim
+        var normalized = name.ToLowerInvariant().Trim();
+        if (string.IsNullOrEmpty(normalized))
+            return 0;
+        
+        // Convert first 10 characters to a numeric score that preserves order
+        // Each character contributes to a position in base-256 number
+        double score = 0;
+        int maxChars = Math.Min(10, normalized.Length);
+        
+        for (int i = 0; i < maxChars; i++)
+        {
+            // Get Unicode value (0-65535 for most characters)
+            int charValue = (int)normalized[i];
+            
+            // Add to score with decreasing weight for each position
+            // Position 0 has highest weight, position 9 has lowest
+            // Using base 256 (enough for extended ASCII)
+            score += charValue * Math.Pow(256, 9 - i);
+        }
+        
+        return score;
     }
 
     private async Task AddToHashAsync(IDatabaseAsync db, Collection collection)
@@ -815,8 +845,10 @@ public class RedisCollectionIndexService : ICollectionIndexService
             // Single MGET call instead of N GET calls (10-20x faster!)
             var jsonValues = await _db.StringGetAsync(hashKeys);
             
-            // Deserialize all summaries
-            var summaries = new List<CollectionSummary>();
+            // Deserialize all summaries while PRESERVING ORDER from sorted set
+            // Use Dictionary for O(1) lookup, then rebuild list in original order
+            var summaryDict = new Dictionary<string, CollectionSummary>();
+            
             for (int i = 0; i < jsonValues.Length; i++)
             {
                 if (jsonValues[i].HasValue)
@@ -826,7 +858,7 @@ public class RedisCollectionIndexService : ICollectionIndexService
                         var summary = JsonSerializer.Deserialize<CollectionSummary>(jsonValues[i].ToString());
                         if (summary != null)
                         {
-                            summaries.Add(summary);
+                            summaryDict[collectionIds[i].ToString()] = summary;
                         }
                     }
                     catch (JsonException ex)
@@ -836,7 +868,18 @@ public class RedisCollectionIndexService : ICollectionIndexService
                 }
             }
             
-            _logger.LogDebug("Batch retrieved {Found}/{Total} collection summaries", summaries.Count, collectionIds.Length);
+            // Rebuild list in the EXACT order from sorted set (critical for sort correctness!)
+            var summaries = new List<CollectionSummary>(collectionIds.Length);
+            foreach (var collectionId in collectionIds)
+            {
+                if (summaryDict.TryGetValue(collectionId.ToString(), out var summary))
+                {
+                    summaries.Add(summary);
+                }
+                // Skip missing collections but maintain order of existing ones
+            }
+            
+            _logger.LogDebug("Batch retrieved {Found}/{Total} collection summaries (order preserved)", summaries.Count, collectionIds.Length);
             return summaries;
         }
         catch (Exception ex)
@@ -942,6 +985,196 @@ public class RedisCollectionIndexService : ICollectionIndexService
             _logger.LogError(ex, "Failed to get collection page {Page} with size {PageSize}", page, pageSize);
             throw;
         }
+    }
+
+    public async Task<CollectionPageResult> SearchCollectionPageAsync(
+        string searchQuery,
+        int page,
+        int pageSize,
+        string sortBy = "updatedAt",
+        string sortDirection = "desc",
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            _logger.LogDebug("Searching collections: query='{Query}', page={Page}, pageSize={PageSize}, sortBy={SortBy}, sortDirection={SortDirection}",
+                searchQuery, page, pageSize, sortBy, sortDirection);
+
+            // Use MongoDB for search - much faster than loading all Redis data
+            // MongoDB has text index on name/description/tags
+            var searchLower = searchQuery.ToLowerInvariant();
+            
+            // Build MongoDB filter: case-insensitive search on name and path
+            var filterBuilder = MongoDB.Driver.Builders<Collection>.Filter;
+            var searchFilter = filterBuilder.And(
+                filterBuilder.Eq(c => c.IsDeleted, false),
+                filterBuilder.Or(
+                    filterBuilder.Regex(c => c.Name, new MongoDB.Bson.BsonRegularExpression(searchQuery, "i")),
+                    filterBuilder.Regex(c => c.Path, new MongoDB.Bson.BsonRegularExpression(searchQuery, "i"))
+                )
+            );
+
+            // Build sort definition
+            var sortBuilder = MongoDB.Driver.Builders<Collection>.Sort;
+            MongoDB.Driver.SortDefinition<Collection> sortDef = sortBy.ToLower() switch
+            {
+                "updatedat" => sortDirection == "desc" 
+                    ? sortBuilder.Descending(c => c.UpdatedAt)
+                    : sortBuilder.Ascending(c => c.UpdatedAt),
+                "createdat" => sortDirection == "desc"
+                    ? sortBuilder.Descending(c => c.CreatedAt)
+                    : sortBuilder.Ascending(c => c.CreatedAt),
+                "name" => sortDirection == "desc"
+                    ? sortBuilder.Descending(c => c.Name)
+                    : sortBuilder.Ascending(c => c.Name),
+                "imagecount" => sortDirection == "desc"
+                    ? sortBuilder.Descending(c => c.Statistics.TotalItems)
+                    : sortBuilder.Ascending(c => c.Statistics.TotalItems),
+                "totalsize" => sortDirection == "desc"
+                    ? sortBuilder.Descending(c => c.Statistics.TotalSize)
+                    : sortBuilder.Ascending(c => c.Statistics.TotalSize),
+                _ => sortDirection == "desc"
+                    ? sortBuilder.Descending(c => c.UpdatedAt)
+                    : sortBuilder.Ascending(c => c.UpdatedAt)
+            };
+
+            // Get total count for pagination
+            var totalCount = await _collectionRepository.CountAsync(searchFilter);
+
+            // Fetch only the page we need from MongoDB (not all data!)
+            var skip = (page - 1) * pageSize;
+            var collections = await _collectionRepository.FindAsync(
+                searchFilter,
+                sortDef,
+                pageSize,
+                skip
+            );
+
+            var collectionList = collections.ToList();
+            
+            _logger.LogDebug("Search found {Count} collections on page {Page} (total {Total})", 
+                collectionList.Count, page, totalCount);
+
+            // Convert to CollectionSummary format
+            var summaries = collectionList.Select(c => new CollectionSummary
+            {
+                Id = c.Id.ToString(),
+                Name = c.Name ?? "",
+                FirstImageId = c.Images?.FirstOrDefault()?.Id.ToString(),
+                ImageCount = c.Images?.Count ?? 0,
+                ThumbnailCount = c.Thumbnails?.Count ?? 0,
+                CacheCount = c.CacheImages?.Count ?? 0,
+                TotalSize = c.Statistics.TotalSize,
+                CreatedAt = c.CreatedAt,
+                UpdatedAt = c.UpdatedAt,
+                LibraryId = c.LibraryId?.ToString() ?? string.Empty,
+                Description = c.Description,
+                Type = (int)c.Type,
+                Tags = new List<string>(),
+                Path = c.Path ?? "",
+                ThumbnailBase64 = null // Will be populated from Redis below
+            }).ToList();
+
+            // Load thumbnails from Redis for this page only (much faster than loading from disk)
+            // Redis already has pre-cached base64 thumbnails from the index
+            await LoadThumbnailsFromRedisAsync(summaries);
+
+            var totalPages = (int)Math.Ceiling((double)totalCount / pageSize);
+
+            return new CollectionPageResult
+            {
+                Collections = summaries,
+                CurrentPage = page,
+                PageSize = pageSize,
+                TotalCount = (int)totalCount,
+                TotalPages = totalPages,
+                HasNext = page < totalPages,
+                HasPrevious = page > 1
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to search collections with query '{Query}'", searchQuery);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Load thumbnails from Redis cache for a list of collection summaries.
+    /// Redis already has pre-cached base64 thumbnails from the index rebuild.
+    /// This is MUCH faster than loading from disk.
+    /// </summary>
+    private async Task LoadThumbnailsFromRedisAsync(List<CollectionSummary> summaries)
+    {
+        if (summaries.Count == 0)
+            return;
+
+        try
+        {
+            // Get collection IDs
+            var collectionIds = summaries
+                .Select(s => new RedisValue(s.Id))
+                .ToArray();
+
+            // Batch fetch full summaries from Redis (which include thumbnails)
+            var cachedSummaries = await BatchGetCollectionSummariesAsync(collectionIds);
+
+            // Create lookup dictionary
+            var thumbnailLookup = cachedSummaries
+                .Where(s => !string.IsNullOrEmpty(s.ThumbnailBase64))
+                .ToDictionary(s => s.Id, s => s.ThumbnailBase64);
+
+            // Update thumbnails in the summaries
+            foreach (var summary in summaries)
+            {
+                if (thumbnailLookup.TryGetValue(summary.Id, out var thumbnailBase64))
+                {
+                    summary.ThumbnailBase64 = thumbnailBase64;
+                }
+            }
+
+            _logger.LogDebug("Loaded {Count} thumbnails from Redis cache for search results", thumbnailLookup.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load thumbnails from Redis, continuing without thumbnails");
+            // Don't throw - thumbnails are optional
+        }
+    }
+
+    /// <summary>
+    /// Sort collections in memory using same logic as Redis sorted sets
+    /// </summary>
+    private List<CollectionSummary> SortCollections(List<CollectionSummary> collections, string sortBy, string sortDirection)
+    {
+        var multiplier = sortDirection == "desc" ? -1 : 1;
+
+        return sortBy.ToLower() switch
+        {
+            "updatedat" => multiplier > 0
+                ? collections.OrderBy(c => c.UpdatedAt).ToList()
+                : collections.OrderByDescending(c => c.UpdatedAt).ToList(),
+
+            "createdat" => multiplier > 0
+                ? collections.OrderBy(c => c.CreatedAt).ToList()
+                : collections.OrderByDescending(c => c.CreatedAt).ToList(),
+
+            "name" => multiplier > 0
+                ? collections.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase).ToList()
+                : collections.OrderByDescending(c => c.Name, StringComparer.OrdinalIgnoreCase).ToList(),
+
+            "imagecount" => multiplier > 0
+                ? collections.OrderBy(c => c.ImageCount).ToList()
+                : collections.OrderByDescending(c => c.ImageCount).ToList(),
+
+            "totalsize" => multiplier > 0
+                ? collections.OrderBy(c => c.TotalSize).ToList()
+                : collections.OrderByDescending(c => c.TotalSize).ToList(),
+
+            _ => multiplier > 0
+                ? collections.OrderBy(c => c.UpdatedAt).ToList()
+                : collections.OrderByDescending(c => c.UpdatedAt).ToList()
+        };
     }
 
     public async Task<CollectionPageResult> GetCollectionsByLibraryAsync(
@@ -1762,7 +1995,7 @@ public class RedisCollectionIndexService : ICollectionIndexService
                 
                 if ((skip / ANALYSIS_BATCH_SIZE + 1) % 10 == 0)
                 {
-                    _logger.LogDebug("📊 Analyzed {Count}/{Total} collections...", 
+                    _logger.LogInformation("📊 Analyzed {Count}/{Total} collections...", 
                         skip + ANALYSIS_BATCH_SIZE, totalCount);
                 }
             }
@@ -1908,7 +2141,7 @@ public class RedisCollectionIndexService : ICollectionIndexService
             
             // Memory monitoring
             var memoryBefore = GC.GetTotalMemory(false);
-            _logger.LogDebug("💾 Batch {Current}/{Total}: Memory before = {MemoryMB:F2} MB", 
+            _logger.LogInformation("💾 Batch {Current}/{Total}: Memory before = {MemoryMB:F2} MB", 
                 currentBatch, totalBatches, memoryBefore / 1024.0 / 1024.0);
             
             var batchIds = collectionIds.Skip(i).Take(BATCH_SIZE).ToList();
@@ -1924,10 +2157,8 @@ public class RedisCollectionIndexService : ICollectionIndexService
             
             var collectionList = batchCollections.ToList();
             
-            // Process batch
-            var batch = _db.CreateBatch();
-            var tasks = new List<Task>();
-            
+            // Process collections sequentially (no batch due to async I/O operations)
+            // Using batch with async file I/O causes deadlock
             foreach (var collection in collectionList)
             {
                 if (cancellationToken.IsCancellationRequested)
@@ -1935,30 +2166,37 @@ public class RedisCollectionIndexService : ICollectionIndexService
                     _logger.LogWarning("⚠️ Index rebuild cancelled");
                     return;
                 }
+
+                _logger.LogDebug("Building index for collection {id}", collection.Id.ToString());
                 
-                // Add to sorted sets
-                tasks.Add(AddToSortedSetsAsync(batch, collection));
+                try
+                {
+                    // Process each collection with direct database operations (not batched)
+                    // This avoids deadlock from async I/O inside batch operations
+                    await AddToSortedSetsAsync(_db, collection);
                 
                 // Add to hash (with optional thumbnail caching)
                 if (!options.SkipThumbnailCaching)
                 {
-                    tasks.Add(AddToHashAsync(batch, collection));
+                        await AddToHashAsync(_db, collection);
                 }
                 else
                 {
                     // Skip thumbnail loading for faster rebuild
-                    tasks.Add(AddToHashWithoutThumbnailAsync(batch, collection));
+                        await AddToHashWithoutThumbnailAsync(_db, collection);
                 }
                 
-                // ✅ NEW: Update state tracking
-                tasks.Add(UpdateCollectionIndexStateAsync(batch, collection));
+                    // Update state tracking
+                    await UpdateCollectionIndexStateAsync(_db, collection);
                 
                 processedCount++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to index collection {CollectionId}, skipping", collection.Id);
+                    // Continue with next collection
+                }
             }
-            
-            // Execute batch
-            batch.Execute();
-            await Task.WhenAll(tasks);
             
             // Memory monitoring after batch
             var memoryAfter = GC.GetTotalMemory(false);
@@ -1968,9 +2206,6 @@ public class RedisCollectionIndexService : ICollectionIndexService
             _logger.LogInformation("✅ Batch {Current}/{Total} complete: {Count} collections in {Duration}ms, Memory delta = {DeltaMB:+0.00;-0.00} MB (now {CurrentMB:F2} MB)", 
                 currentBatch, totalBatches, collectionList.Count, batchDuration.TotalMilliseconds,
                 memoryDelta / 1024.0 / 1024.0, memoryAfter / 1024.0 / 1024.0);
-            
-            // ✅ CRITICAL: Clear tasks list to release memory
-            tasks.Clear();
             
             // Force GC after each batch
             collectionList.Clear();
@@ -2304,6 +2539,637 @@ public class RedisCollectionIndexService : ICollectionIndexService
         }
     }
     
+    #endregion
+
+    #region Archive Entry Path Fix
+
+    /// <summary>
+    /// Extract dimensions for images and update collection.
+    /// This fixes both path issues and missing width/height values.
+    /// </summary>
+    private async Task AtomicUpdateImageArchiveEntriesAsync(ObjectId collectionId, Collection collection, string? fixMode = null)
+    {
+        int dimensionsFilled = 0;
+        bool shouldFixDimensions = string.IsNullOrEmpty(fixMode) || fixMode == "All" || fixMode == "DimensionsOnly";
+        
+        // ✅ Extract dimensions using same logic as CollectionScanConsumer
+        if (shouldFixDimensions)
+        {
+            for (int i = 0; i < collection.Images.Count; i++)
+            {
+                var image = collection.Images[i];
+                
+                // Only process images with missing dimensions (and not __MACOSX)
+                if ((image.Width == 0 || image.Height == 0) && 
+                    image.ArchiveEntry != null && 
+                    !image.RelativePath.Contains("__MACOSX"))
+                {
+                    try
+                    {
+                        // Use same logic as CollectionScanConsumer - handles both regular files and archives
+                        var (width, height) = await ExtractImageDimensionsAsync(image.ArchiveEntry);
+                        if (width > 0 && height > 0)
+                        {
+                            // Update dimensions in memory before saving
+                            image.UpdateMetadata(width, height, image.FileSize);
+                            dimensionsFilled++;
+                            _logger.LogDebug("📊 Extracted dimensions for {Entry}: {Width}x{Height}", 
+                                image.ArchiveEntry.EntryName, width, height);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "⚠️ Failed to extract dimensions for {Entry}", image.ArchiveEntry?.EntryName);
+                    }
+                }
+            }
+        }
+        
+        // Update collection with modified images (includes both archive entry fixes and dimension extraction)
+        await _collectionRepository.UpdateAsync(collection);
+        
+        if (shouldFixDimensions)
+        {
+            _logger.LogInformation("✅ Updated collection with {Count} images, filled {DimCount} missing dimensions", 
+                collection.Images.Count, dimensionsFilled);
+        }
+        else
+        {
+            _logger.LogInformation("✅ Updated collection with {Count} images (paths only, skipped dimensions)", 
+                collection.Images.Count);
+        }
+        
+        // Invalidate Redis cache for this collection
+        await _db.KeyDeleteAsync($"collection:{collectionId}");
+    }
+
+    /// <summary>
+    /// Extract image dimensions (handles BOTH regular files and archive entries).
+    /// Uses IImageProcessingService which now properly handles archive extraction.
+    /// </summary>
+    private async Task<(int width, int height)> ExtractImageDimensionsAsync(ArchiveEntryInfo archiveEntry)
+    {
+        try
+        {
+            // IImageProcessingService now handles BOTH regular files and archive entries
+            var dimensions = await _imageProcessingService.GetImageDimensionsAsync(archiveEntry);
+            if (dimensions != null && dimensions.Width > 0 && dimensions.Height > 0)
+            {
+                return (dimensions.Width, dimensions.Height);
+            }
+            
+            return (0, 0); // Default to 0 if extraction fails
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "⚠️ Failed to extract dimensions for {Path}#{Entry}", 
+                archiveEntry.ArchivePath, archiveEntry.EntryName);
+            return (0, 0);
+        }
+    }
+
+    /// <summary>
+    /// Fix archive entry paths for collections with missing folder structure.
+    /// This repairs the bug where entryName/entryPath don't include folders inside archives.
+    /// </summary>
+    public async Task<ArchiveEntryFixResult> FixArchiveEntryPathsAsync(
+        bool dryRun = true,
+        int? limit = null,
+        string? collectionId = null,
+        string? fixMode = null, // "All", "DimensionsOnly", "PathsOnly"
+        bool onlyCorrupted = false, // If true, only process collections with dimension issues
+        CancellationToken cancellationToken = default)
+    {
+        var result = new ArchiveEntryFixResult
+        {
+            DryRun = dryRun,
+            StartedAt = DateTime.UtcNow
+        };
+
+        try
+        {
+            // 🎯 SINGLE COLLECTION MODE (for debugging)
+            if (!string.IsNullOrEmpty(collectionId))
+            {
+                _logger.LogInformation("🔧 Starting archive entry fix for SINGLE collection (DryRun={DryRun}, CollectionId={CollectionId})", 
+                    dryRun, collectionId);
+
+                var collection = await _collectionRepository.GetByIdAsync(new MongoDB.Bson.ObjectId(collectionId));
+                
+                if (collection == null)
+                {
+                    _logger.LogWarning("⚠️ Collection {CollectionId} not found", collectionId);
+                    result.ErrorMessages.Add($"Collection {collectionId} not found");
+                    result.CompletedAt = DateTime.UtcNow;
+                    result.Duration = result.CompletedAt - result.StartedAt;
+                    return result;
+                }
+
+                _logger.LogInformation("📊 Processing single collection: {Name} (Type={Type})",
+                    collection.Name, collection.Type);
+
+                var fixedCount = await FixSingleCollectionArchiveEntriesAsync(collection, dryRun, fixMode, cancellationToken);
+                
+                if (fixedCount > 0)
+                {
+                    result.CollectionsWithIssues = 1;
+                    result.ImagesFixed = fixedCount;
+                    result.FixedCollectionIds.Add(collection.Id.ToString());
+                    
+                    _logger.LogInformation("✅ Fixed {Count} images in collection {Name}",
+                        fixedCount, collection.Name);
+                }
+                else
+                {
+                    _logger.LogInformation("✅ No issues found in collection {Name}", collection.Name);
+                }
+
+                result.TotalCollectionsScanned = 1;
+                result.CompletedAt = DateTime.UtcNow;
+                result.Duration = result.CompletedAt - result.StartedAt;
+
+                return result;
+            }
+
+            // 📊 NORMAL MODE: Process multiple collections
+            _logger.LogInformation("🔧 Starting archive entry fix for ALL collections (DryRun={DryRun}, Limit={Limit}, FixMode={FixMode}, OnlyCorrupted={OnlyCorrupted})", 
+                dryRun, limit, fixMode ?? "All", onlyCorrupted);
+
+            // ✅ Build filter based on options
+            var filterBuilder = MongoDB.Driver.Builders<Collection>.Filter;
+            var filter = filterBuilder.Eq(c => c.IsDeleted, false);
+
+            // 🎯 If onlyCorrupted=true, only select collections with dimension issues
+            MongoDB.Driver.FilterDefinition<Collection> dimensionFilter = null;
+            if (onlyCorrupted)
+            {
+                dimensionFilter = filterBuilder.ElemMatch(c => c.Images, img =>
+                    (img.Width == 0 || img.Height == 0) &&
+                    !img.RelativePath.Contains("__MACOSX")
+                );
+                filter = filterBuilder.And(filter, dimensionFilter);
+                
+                _logger.LogInformation("🎯 Filtering for collections with dimension issues only (excludes __MACOSX)");
+            }
+
+            var totalCollections = await _collectionRepository.CountAsync(filter);
+            var collectionsToProcess = limit.HasValue ? Math.Min((int)totalCollections, limit.Value) : (int)totalCollections;
+
+            _logger.LogInformation("📊 Found {Total} collections matching filter, will process {Process}",
+                totalCollections, collectionsToProcess);
+            
+            // 🔍 DEBUG: Check if specific test collection matches filter
+            //if (onlyCorrupted && dimensionFilter != null)
+            //{
+            //    try
+            //    {
+            //        var testCollectionId = new MongoDB.Bson.ObjectId("68f2a388ff19d7b375b40da9");
+            //        var testFilter = filterBuilder.And(
+            //            filterBuilder.Eq(c => c.Id, testCollectionId),
+            //            dimensionFilter
+            //        );
+            //        var testCount = await _collectionRepository.CountAsync(testFilter);
+            //        _logger.LogInformation("🔍 DEBUG: Test collection 68f2a388ff19d7b375b40da9 matches dimension filter: {Matches}", testCount > 0);
+            //    }
+            //    catch (Exception ex)
+            //    {
+            //        _logger.LogDebug(ex, "Debug test collection check failed");
+            //    }
+            //}
+
+            // Process in batches
+            const int BATCH_SIZE = 50;
+            var processed = 0;
+
+            for (var skip = 0; skip < collectionsToProcess && !cancellationToken.IsCancellationRequested; skip += BATCH_SIZE)
+            {
+                var batchSize = Math.Min(BATCH_SIZE, collectionsToProcess - skip);
+                var collections = await _collectionRepository.FindAsync(
+                    filter,
+                    MongoDB.Driver.Builders<Collection>.Sort.Ascending(c => c.Id),
+                    batchSize,
+                    skip
+                );
+
+                foreach (var collection in collections)
+                {
+                    try
+                    {
+                        var fixedCount = await FixSingleCollectionArchiveEntriesAsync(collection, dryRun, fixMode, cancellationToken);
+                        
+                        if (fixedCount > 0)
+                        {
+                            result.CollectionsWithIssues++;
+                            result.ImagesFixed += fixedCount;
+                            result.FixedCollectionIds.Add(collection.Id.ToString());
+                            
+                            _logger.LogInformation("✅ Fixed {Count} images in collection {Name} ({Id})",
+                                fixedCount, collection.Name, collection.Id);
+                        }
+
+                        processed++;
+                        result.TotalCollectionsScanned++;
+
+                        if (processed % 10 == 0)
+                        {
+                            _logger.LogInformation("📊 Progress: {Processed}/{Total} collections scanned, {Issues} with issues, {Fixed} images fixed",
+                                processed, collectionsToProcess, result.CollectionsWithIssues, result.ImagesFixed);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to fix collection {CollectionId}", collection.Id);
+                        result.ErrorMessages.Add($"Collection {collection.Id}: {ex.Message}");
+                    }
+                }
+            }
+
+            result.CompletedAt = DateTime.UtcNow;
+            result.Duration = result.CompletedAt - result.StartedAt;
+
+            _logger.LogInformation("✅ Archive entry fix complete (folders + archives): Scanned={Scanned}, WithIssues={Issues}, ImagesFixed={Fixed}, Duration={Duration}",
+                result.TotalCollectionsScanned, result.CollectionsWithIssues, result.ImagesFixed, result.Duration);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Failed to fix archive entries");
+            result.CompletedAt = DateTime.UtcNow;
+            result.Duration = result.CompletedAt - result.StartedAt;
+            result.ErrorMessages.Add($"Fatal error: {ex.Message}");
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Fix archive entry paths for a single collection by opening the archive/folder and matching entries
+    /// </summary>
+    private async Task<int> FixSingleCollectionArchiveEntriesAsync(
+        Collection collection,
+        bool dryRun,
+        string? fixMode,
+        CancellationToken cancellationToken)
+    {
+        if (collection.Images == null || collection.Images.Count == 0)
+            return 0;
+
+        // 🎯 DIMENSIONS ONLY MODE: Skip path checking, only fix dimensions
+        if (fixMode == "DimensionsOnly")
+        {
+            // Count images with dimension issues (excluding __MACOSX)
+            // ✅ FIX: Process BOTH regular files and archive entries
+            var imagesNeedingDimensions = collection.Images.Count(img =>
+                (img.Width == 0 || img.Height == 0) &&
+                img.ArchiveEntry != null &&
+                !img.RelativePath.Contains("__MACOSX")
+            );
+
+            if (imagesNeedingDimensions == 0)
+            {
+                _logger.LogDebug("✅ Collection {Name} has no dimension issues", collection.Name);
+                return 0;
+            }
+
+            _logger.LogInformation("📊 Collection {Name} has {Count} images needing dimension extraction (regular files + archive entries)", 
+                collection.Name, imagesNeedingDimensions);
+
+            if (!dryRun)
+            {
+                await AtomicUpdateImageArchiveEntriesAsync(collection.Id, collection, fixMode);
+                _logger.LogInformation("💾 Updated collection {Name} with dimensions", collection.Name);
+            }
+
+            return imagesNeedingDimensions;
+        }
+
+        // Check if collection path exists (only needed for path fixing modes)
+        if (!File.Exists(collection.Path) && !Directory.Exists(collection.Path))
+        {
+            _logger.LogWarning("⚠️ Collection path not found: {Path}", collection.Path);
+            return 0;
+        }
+
+        // Dispatch to folder or archive handler for path fixing
+        if (collection.Type == CollectionType.Folder)
+        {
+            return await FixFolderCollectionArchiveEntriesAsync(collection, dryRun, fixMode, cancellationToken);
+        }
+        else
+        {
+            return await FixArchiveCollectionArchiveEntriesAsync(collection, dryRun, fixMode, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Fix ArchiveEntry for folder collections by scanning the file system
+    /// </summary>
+    private async Task<int> FixFolderCollectionArchiveEntriesAsync(
+        Collection collection,
+        bool dryRun,
+        string? fixMode,
+        CancellationToken cancellationToken)
+    {
+        var fixedCount = 0;
+        var needsUpdate = false;
+
+        try
+        {
+            // For folder collections, build a lookup of existing files
+            // Key = relative path (with subfolders), Value = full absolute path
+            var filesByRelativePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            // Fallback: Key = filename only, Value = relative path (for first match)
+            var filesByName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            
+            if (Directory.Exists(collection.Path))
+            {
+                var files = Directory.GetFiles(collection.Path, "*.*", SearchOption.AllDirectories);
+                foreach (var file in files)
+                {
+                    var filename = Path.GetFileName(file);
+                    var relativePath = Path.GetRelativePath(collection.Path, file);
+                    
+                    // Store by relative path (unique key)
+                    filesByRelativePath[relativePath] = file;
+                    
+                    // Store by filename for fallback (first match only)
+                    if (!filesByName.ContainsKey(filename))
+                    {
+                        filesByName[filename] = relativePath;
+                    }
+                }
+            }
+
+            // Check each image
+            foreach (var image in collection.Images)
+            {
+                var filename = image.Filename;
+                var currentRelativePath = image.RelativePath;
+                var hasArchiveEntry = image.ArchiveEntry != null;
+
+                // Find the correct relative path
+                string correctRelativePath;
+                string correctFullPath;
+                
+                // METHOD 1: Try to find by current RelativePath (most accurate)
+                if (!string.IsNullOrEmpty(currentRelativePath) && filesByRelativePath.ContainsKey(currentRelativePath))
+                {
+                    correctRelativePath = currentRelativePath;
+                    correctFullPath = filesByRelativePath[currentRelativePath];
+                }
+                // METHOD 2: Fallback to filename-only matching (for legacy data)
+                else if (filesByName.ContainsKey(filename))
+                {
+                    correctRelativePath = filesByName[filename];
+                    correctFullPath = filesByRelativePath[correctRelativePath];
+                    
+                    _logger.LogDebug("📂 Using filename fallback for {Filename}: '{Current}' → '{Correct}'",
+                        filename, currentRelativePath, correctRelativePath);
+                }
+                else
+                {
+                    // File doesn't exist on disk anymore - skip
+                    _logger.LogWarning("⚠️ File not found on disk: {Filename} (RelativePath: {RelPath}) in {Collection}",
+                        filename, currentRelativePath, collection.Name);
+                    continue;
+                }
+
+                // Ensure correctFullPath is absolute
+                if (!Path.IsPathRooted(correctFullPath))
+                {
+                    correctFullPath = Path.Combine(collection.Path, correctRelativePath);
+                }
+
+                // DETECTION: Check if ArchiveEntry is null OR has wrong data
+                var needsFix = false;
+                string issue = "";
+
+                if (!hasArchiveEntry)
+                {
+                    needsFix = true;
+                    issue = "ArchiveEntry is null";
+                }
+                else if (image.ArchiveEntry!.EntryName != correctRelativePath)
+                {
+                    needsFix = true;
+                    issue = $"EntryName mismatch: '{image.ArchiveEntry.EntryName}' != '{correctRelativePath}'";
+                }
+                else if (image.ArchiveEntry.EntryPath != correctFullPath)
+                {
+                    needsFix = true;
+                    issue = $"EntryPath mismatch: '{image.ArchiveEntry.EntryPath}' != '{correctFullPath}'";
+                }
+                else if (image.RelativePath != correctRelativePath)
+                {
+                    needsFix = true;
+                    issue = $"RelativePath mismatch: '{image.RelativePath}' != '{correctRelativePath}'";
+                }
+
+                if (needsFix)
+                {
+                    _logger.LogDebug("📂 Folder image needs fix: {Filename} in {Collection} - {Issue}",
+                        filename, collection.Name, issue);
+
+                    if (!dryRun)
+                    {
+                        // Create or update ArchiveEntry for folder collection
+                        var newArchiveEntry = new ArchiveEntryInfo
+                        {
+                            ArchivePath = collection.Path,         // Collection root path
+                            EntryName = correctRelativePath,       // Relative path from collection root
+                            EntryPath = correctFullPath,           // Full absolute path
+                            FileType = ImageFileType.RegularFile,
+                            CompressedSize = 0,
+                            UncompressedSize = 0
+                        };
+                        
+                        // Set IsDirectory through reflection or directly (it's deprecated but still settable)
+#pragma warning disable CS0618 // IsDirectory is obsolete but we need to set it
+                        newArchiveEntry.IsDirectory = true;  // Regular file (not in archive)
+#pragma warning restore CS0618
+                        
+                        // Use SetArchiveEntry to update (works for both null and non-null cases)
+                        image.SetArchiveEntry(newArchiveEntry, correctRelativePath);
+                        needsUpdate = true;
+                    }
+
+                    fixedCount++;
+                }
+            }
+
+            // ✅ FIX: Extract dimensions and update collection
+            if (needsUpdate && !dryRun)
+            {
+                await AtomicUpdateImageArchiveEntriesAsync(collection.Id, collection, fixMode);
+                _logger.LogInformation("💾 Updated folder collection {Id} with {Count} fixed entries",
+                    collection.Id, fixedCount);
+            }
+
+            return fixedCount;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to fix folder collection {CollectionId}", collection.Id);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Fix ArchiveEntry for archive collections by opening the archive
+    /// </summary>
+    private async Task<int> FixArchiveCollectionArchiveEntriesAsync(
+        Collection collection,
+        bool dryRun,
+        string? fixMode,
+        CancellationToken cancellationToken)
+    {
+        var fixedCount = 0;
+        var needsUpdate = false;
+
+        try
+        {
+            // Open archive and build entry lookup
+            using var archive = SharpCompress.Archives.ArchiveFactory.Open(collection.Path);
+            
+            // Two lookups: by full path (primary) and by filename (fallback)
+            var entriesByPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var entriesByName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            // Build lookups from archive entries
+            foreach (var entry in archive.Entries.Where(e => !e.IsDirectory))
+            {
+                var filename = Path.GetFileName(entry.Key);
+                var entryPath = entry.Key;  // Full path inside archive (includes folders)
+                
+                // Store by full path (unique, includes folder structure)
+                entriesByPath[entryPath] = entryPath;
+                
+                // Store by filename for fallback (first match only)
+                if (!entriesByName.ContainsKey(filename))
+                {
+                    entriesByName[filename] = entryPath;
+                }
+            }
+
+            _logger.LogDebug("📊 Archive {Archive} contains {Total} entries, {Unique} unique filenames",
+                Path.GetFileName(collection.Path), entriesByPath.Count, entriesByName.Count);
+
+            // Check each image for incorrect paths or null ArchiveEntry
+            foreach (var image in collection.Images)
+            {
+                var filename = image.Filename;
+                var currentRelativePath = image.RelativePath;
+                var hasArchiveEntry = image.ArchiveEntry != null;
+                var currentEntryName = hasArchiveEntry ? image.ArchiveEntry!.EntryName : null;
+
+                // Find correct path in archive
+                string correctPath;
+                
+                // METHOD 1: Try exact match by current EntryName (most accurate)
+                if (!string.IsNullOrEmpty(currentEntryName) && entriesByPath.ContainsKey(currentEntryName))
+                {
+                    correctPath = currentEntryName;  // Already correct
+                }
+                // METHOD 2: Try exact match by RelativePath
+                else if (!string.IsNullOrEmpty(currentRelativePath) && entriesByPath.ContainsKey(currentRelativePath))
+                {
+                    correctPath = currentRelativePath;
+                }
+                // METHOD 3: Fallback to filename-only matching (for corrupted data)
+                else if (entriesByName.ContainsKey(filename))
+                {
+                    correctPath = entriesByName[filename];
+                    
+                    _logger.LogDebug("🗜️ Using filename fallback for {Filename}: EntryName='{Current}' → '{Correct}'",
+                        filename, currentEntryName ?? "null", correctPath);
+                }
+                else
+                {
+                    // File doesn't exist in archive
+                    _logger.LogWarning("⚠️ Image {ImageId} filename '{Filename}' not found in archive {Archive}", 
+                        image.Id, filename, Path.GetFileName(collection.Path));
+                    continue;
+                }
+
+                // DETECTION: Check if ArchiveEntry is null OR has corrupted data
+                var needsFix = false;
+                string issue = "";
+
+                if (!hasArchiveEntry)
+                {
+                    needsFix = true;
+                    issue = "ArchiveEntry is null (legacy data)";
+                }
+                else
+                {
+                    // Check all three fields for corruption
+                    // All should match the correct path from archive
+                    if (correctPath != currentEntryName)
+                    {
+                        needsFix = true;
+                        issue = $"EntryName mismatch: '{currentEntryName}' != '{correctPath}'";
+                    }
+                    else if (correctPath != currentRelativePath)
+                    {
+                        needsFix = true;
+                        issue = $"RelativePath mismatch: '{currentRelativePath}' != '{correctPath}'";
+                    }
+                    else if (image.ArchiveEntry.EntryPath != correctPath)
+                    {
+                        needsFix = true;
+                        issue = $"EntryPath mismatch: '{image.ArchiveEntry.EntryPath}' != '{correctPath}'";
+                    }
+                }
+
+                if (needsFix)
+                {
+                    _logger.LogDebug("🗜️ Archive image needs fix: {Filename} in {Collection} - {Issue}",
+                        filename, collection.Name, issue);
+
+                    if (!dryRun)
+                    {
+                        if (!hasArchiveEntry)
+                        {
+                            // ✅ CREATE new ArchiveEntry for legacy data
+                            var newArchiveEntry = ArchiveEntryInfo.ForArchiveEntry(
+                                collection.Path,
+                                correctPath,  // EntryName (path inside archive)
+                                correctPath,  // EntryPath (same as EntryName for archives)
+                                0,            // CompressedSize (unknown)
+                                0             // UncompressedSize (unknown)
+                            );
+                            image.SetArchiveEntry(newArchiveEntry, correctPath);
+                        }
+                        else
+                        {
+                            // ✅ UPDATE existing ArchiveEntry
+                            image.UpdateArchiveEntryPath(correctPath);
+                        }
+                        
+                        needsUpdate = true;
+                    }
+
+                    fixedCount++;
+                }
+            }
+
+            // ✅ FIX: Extract dimensions and update collection
+            if (needsUpdate && !dryRun)
+            {
+                await AtomicUpdateImageArchiveEntriesAsync(collection.Id, collection, fixMode);
+                _logger.LogInformation("💾 Updated archive collection {Id} with {Count} fixed entries",
+                    collection.Id, fixedCount);
+            }
+
+            return fixedCount;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to fix archive collection {CollectionId}", collection.Id);
+            throw;
+        }
+    }
+
     #endregion
 }
 

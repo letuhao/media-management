@@ -6,6 +6,7 @@ using ImageViewer.Application.DTOs.Collections;
 using ImageViewer.Domain.Exceptions;
 using ImageViewer.Domain.Enums;
 using ImageViewer.Domain.ValueObjects;
+using ImageViewer.Domain.Interfaces;
 
 namespace ImageViewer.Api.Controllers;
 
@@ -267,7 +268,7 @@ public class CollectionsController : ControllerBase
     }
 
     /// <summary>
-    /// Get all collections with pagination (returns lightweight overview DTOs)
+    /// Get all collections with pagination and search (returns lightweight overview DTOs)
     /// </summary>
     [HttpGet]
     public async Task<IActionResult> GetCollections(
@@ -275,19 +276,35 @@ public class CollectionsController : ControllerBase
         [FromQuery] int pageSize = 20,
         [FromQuery] int? limit = null, // Support both pageSize and limit for compatibility
         [FromQuery] string sortBy = "updatedAt",
-        [FromQuery] string sortDirection = "desc")
+        [FromQuery] string sortDirection = "desc",
+        [FromQuery] string? search = null) // NEW: Search parameter
     {
         try
         {
             // Use limit if provided, otherwise fall back to pageSize
             var effectivePageSize = limit ?? pageSize;
             
-            // Use Redis cache index for fast pagination instead of MongoDB queries
-            var pageResult = await _collectionIndexService.GetCollectionPageAsync(
-                page, 
-                effectivePageSize, 
-                sortBy, 
-                sortDirection);
+            CollectionPageResult pageResult;
+            
+            // If search query provided, use search-enabled method
+            if (!string.IsNullOrWhiteSpace(search))
+            {
+                pageResult = await _collectionIndexService.SearchCollectionPageAsync(
+                    search,
+                    page,
+                    effectivePageSize,
+                    sortBy,
+                    sortDirection);
+            }
+            else
+            {
+                // Use Redis cache index for fast pagination instead of MongoDB queries
+                pageResult = await _collectionIndexService.GetCollectionPageAsync(
+                    page,
+                    effectivePageSize,
+                    sortBy,
+                    sortDirection);
+            }
             
             // Convert CollectionSummary to CollectionOverviewDto
             // Thumbnails are already pre-cached as base64 in Redis index for instant display!
@@ -310,8 +327,8 @@ public class CollectionsController : ControllerBase
                 ThumbnailBase64 = summary.ThumbnailBase64 // ✅ Already pre-cached in Redis!
             }).ToList();
             
-            _logger.LogDebug("Returned {Count} collections with {ThumbnailCount} pre-cached thumbnails", 
-                overviewDtos.Count, overviewDtos.Count(d => d.ThumbnailBase64 != null));
+            _logger.LogDebug("Returned {Count} collections with {ThumbnailCount} pre-cached thumbnails (search: {Search})", 
+                overviewDtos.Count, overviewDtos.Count(d => d.ThumbnailBase64 != null), search ?? "none");
             
             // Create paginated response using Redis cache data
             var response = new
@@ -322,7 +339,8 @@ public class CollectionsController : ControllerBase
                 total = pageResult.TotalCount,
                 totalPages = pageResult.TotalPages,
                 hasNext = pageResult.HasNext,
-                hasPrevious = pageResult.HasPrevious
+                hasPrevious = pageResult.HasPrevious,
+                search = search // Return search term for frontend
             };
             
             return Ok(response);

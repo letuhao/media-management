@@ -104,11 +104,12 @@ public class ImageEmbedded
         {
             // Create a default ArchiveEntryInfo for legacy data
             // This handles old data that doesn't have ArchiveEntryInfo
+            // ✅ FIX: Use relativePath (not filename) to preserve folder structure
             ArchiveEntry = new ArchiveEntryInfo
             {
                 ArchivePath = "", // Will be empty for legacy data
-                EntryName = filename,
-                EntryPath = filename,
+                EntryName = relativePath,  // ✅ Use full path
+                EntryPath = relativePath,  // ✅ Use full path
                 FileType = ImageFileType.RegularFile // Default to regular file
             };
             FileType = ImageFileType.RegularFile;
@@ -171,6 +172,33 @@ public class ImageEmbedded
     public void SetMetadata(ImageMetadataEmbedded metadata)
     {
         Metadata = metadata;
+        UpdatedAt = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// Update archive entry path to fix incorrect folder structure.
+    /// Updates EntryName, EntryPath, and RelativePath to match the correct path from archive.
+    /// </summary>
+    public void UpdateArchiveEntryPath(string correctPathInsideArchive)
+    {
+        if (ArchiveEntry == null)
+            return;
+
+        // Update all path fields to be consistent
+        ArchiveEntry.EntryName = correctPathInsideArchive;
+        ArchiveEntry.EntryPath = correctPathInsideArchive;
+        RelativePath = correctPathInsideArchive;  // RelativePath should match entry path for archives
+        UpdatedAt = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// Creates or updates ArchiveEntry for repair operations.
+    /// Used by the repair tool to fix legacy data or incorrect paths.
+    /// </summary>
+    public void SetArchiveEntry(ArchiveEntryInfo newArchiveEntry, string newRelativePath)
+    {
+        ArchiveEntry = newArchiveEntry ?? throw new ArgumentNullException(nameof(newArchiveEntry));
+        RelativePath = newRelativePath ?? throw new ArgumentNullException(nameof(newRelativePath));
         UpdatedAt = DateTime.UtcNow;
     }
 

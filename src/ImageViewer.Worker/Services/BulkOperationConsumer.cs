@@ -328,13 +328,15 @@ public class BulkOperationConsumer : BaseMessageConsumer
                     {
                         ImageId = image.Id, // Already a string
                         CollectionId = collection.Id.ToString(), // Use collection.Id from outer loop
-                        //ImagePath = image.GetDisplayPath(), // Use the new DTO method for display path
+                        //ImagePath = image.GetDisplayPath(); // Use the new DTO method for display path
                         //ImageFilename = image.Filename,
-                        ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                        // ✅ FIX: Use existing ArchiveEntry from image (has correct path), or create from RelativePath
+                        ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                             collection.Path, 
                             collection.Type, 
                             image.Filename, 
-                            image.FileSize),
+                            image.FileSize,
+                            image.RelativePath),
                         ThumbnailWidth = thumbnailWidth, // Loaded from system settings
                         ThumbnailHeight = thumbnailHeight, // Loaded from system settings
                     };
@@ -412,11 +414,13 @@ public class BulkOperationConsumer : BaseMessageConsumer
                         ImageId = image.Id, // Already a string
                         CollectionId = collection.Id.ToString(), // Use collection.Id from outer loop
                         //ImagePath = image.GetDisplayPath(), // Use the new DTO method for display path
-                        ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                        // ✅ FIX: Reuse existing ArchiveEntry from image (has correct path)
+                        ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                             collection.Path, 
                             collection.Type, 
                             image.Filename, 
-                            image.FileSize),
+                            image.FileSize,
+                            image.RelativePath),
                         //CachePath = "", // Will be determined by cache service
                         CacheWidth = 1920, // Default cache size
                         CacheHeight = 1080,
@@ -587,11 +591,13 @@ public class BulkOperationConsumer : BaseMessageConsumer
                             CollectionId = collectionId.ToString(),
                             //ImagePath = collection.GetFullImagePath(image), // Use full path
                             //ImageFilename = image.Filename,
-                            ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                            // ✅ FIX: Reuse existing ArchiveEntry from image
+                            ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                                 collection.Path, 
                                 collection.Type, 
                                 image.Filename, 
-                                image.FileSize),
+                                image.FileSize,
+                                image.RelativePath),
                             ThumbnailWidth = thumbnailWidth,
                             ThumbnailHeight = thumbnailHeight,
                             ScanJobId = bulkMessage.JobId // Link to parent scan job
@@ -735,11 +741,13 @@ public class BulkOperationConsumer : BaseMessageConsumer
                             CollectionId = collectionId.ToString(),
                             //ImagePath = collection.GetFullImagePath(image), // Use full path
                             //CachePath = "", // Will be determined by cache service
-                            ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                            // ✅ FIX: Reuse existing ArchiveEntry from image
+                            ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                                 collection.Path, 
                                 collection.Type, 
                                 image.Filename, 
-                                image.FileSize),
+                                image.FileSize,
+                                image.RelativePath),
                             CacheWidth = cacheWidth,
                             CacheHeight = cacheHeight,
                             Quality = cacheQuality,

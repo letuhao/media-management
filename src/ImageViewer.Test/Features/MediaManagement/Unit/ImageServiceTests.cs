@@ -18,6 +18,7 @@ public class ImageServiceTests
     private readonly Mock<ICollectionRepository> _mockCollectionRepository;
     private readonly Mock<IImageProcessingService> _mockImageProcessingService;
     private readonly Mock<ICacheService> _mockCacheService;
+    private readonly Mock<IImageProcessingSettingsService> _mockImageProcessingSettingsService;
     private readonly Mock<ILogger<ImageService>> _mockLogger;
     private readonly Mock<IOptions<ImageSizeOptions>> _mockImageSizeOptions;
     private readonly ImageService _imageService;
@@ -27,6 +28,7 @@ public class ImageServiceTests
         _mockCollectionRepository = new Mock<ICollectionRepository>();
         _mockImageProcessingService = new Mock<IImageProcessingService>();
         _mockCacheService = new Mock<ICacheService>();
+        _mockImageProcessingSettingsService = new Mock<IImageProcessingSettingsService>();
         _mockLogger = new Mock<ILogger<ImageService>>();
         _mockImageSizeOptions = new Mock<IOptions<ImageSizeOptions>>();
         
@@ -40,12 +42,17 @@ public class ImageServiceTests
         };
         
         _mockImageSizeOptions.Setup(x => x.Value).Returns(imageSizeOptions);
+        
+        // Setup default settings service values
+        _mockImageProcessingSettingsService.Setup(x => x.GetThumbnailQualityAsync()).ReturnsAsync(100);
+        _mockImageProcessingSettingsService.Setup(x => x.GetThumbnailSizeAsync()).ReturnsAsync(300);
 
         var mockCollectionService = new Mock<ICollectionService>();
         _imageService = new ImageService(
             _mockCollectionRepository.Object,
             _mockImageProcessingService.Object,
             _mockCacheService.Object,
+            _mockImageProcessingSettingsService.Object,
             _mockLogger.Object,
             _mockImageSizeOptions.Object,
             mockCollectionService.Object);

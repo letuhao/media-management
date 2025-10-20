@@ -26,8 +26,8 @@ export const collectionKeys = {
   stats: () => [...collectionKeys.all, 'stats'] as const,
 };
 
-// Fetch all collections with pagination
-export const useCollections = (params?: PaginationParams) => {
+// Fetch all collections with pagination and optional search
+export const useCollections = (params?: PaginationParams & { search?: string }) => {
   return useQuery({
     queryKey: collectionKeys.list(params),
     queryFn: async () => {

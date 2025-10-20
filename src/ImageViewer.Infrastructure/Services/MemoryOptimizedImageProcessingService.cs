@@ -1,9 +1,12 @@
 using ImageViewer.Domain.Interfaces;
 using ImageViewer.Domain.ValueObjects;
+using ImageViewer.Domain.Enums;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SkiaSharp;
 using System.Collections.Concurrent;
+using SharpCompress.Archives;
+using ImageViewer.Application.Helpers;
 
 namespace ImageViewer.Infrastructure.Services;
 
@@ -195,9 +198,54 @@ public class MemoryOptimizedImageProcessingService : IImageProcessingService
     {
         try
         {
-            _logger.LogDebug("📏 Getting image dimensions from {ImagePath}", archiveEntry.GetPhysicalFileFullPath());
+            _logger.LogDebug("📏 Getting image dimensions from {ImagePath}", archiveEntry.GetDisplayPath());
 
-            var imageBytes = await ReadFileToMemoryAsync(archiveEntry.GetPhysicalFileFullPath(), cancellationToken);
+            byte[] imageBytes;
+            
+            // ✅ Handle archive entries using SharpCompress (same logic as ArchiveFileHelper)
+            if (archiveEntry.FileType == ImageFileType.ArchiveEntry)
+            {
+                if (!File.Exists(archiveEntry.ArchivePath))
+                {
+                    _logger.LogWarning("Archive not found: {Path}", archiveEntry.ArchivePath);
+                    return null;
+                }
+
+                using var archive = ArchiveFactory.Open(archiveEntry.ArchivePath);
+                
+                // Try exact match
+                var entry = archive.Entries.FirstOrDefault(e => 
+                    !e.IsDirectory && 
+                    MacOSXFilterHelper.IsSafeToProcess(e.Key, "dimension extraction") &&
+                    (e.Key == archiveEntry.EntryName || e.Key.Replace('\\', '/') == archiveEntry.EntryName.Replace('\\', '/')));
+                
+                // Fallback: filename only
+                if (entry == null)
+                {
+                    var filename = Path.GetFileName(archiveEntry.EntryName);
+                    entry = archive.Entries.FirstOrDefault(e => 
+                        !e.IsDirectory && 
+                        MacOSXFilterHelper.IsSafeToProcess(e.Key, "dimension extraction") &&
+                        Path.GetFileName(e.Key).Equals(filename, StringComparison.OrdinalIgnoreCase));
+                }
+                
+                if (entry == null)
+                {
+                    _logger.LogWarning("Entry {Entry} not found in {Archive}", archiveEntry.EntryName, archiveEntry.ArchivePath);
+                    return null;
+                }
+
+                using var entryStream = entry.OpenEntryStream();
+                using var memoryStream = new MemoryStream();
+                await entryStream.CopyToAsync(memoryStream, cancellationToken);
+                imageBytes = memoryStream.ToArray();
+            }
+            else
+            {
+                // For regular files
+                imageBytes = await ReadFileToMemoryAsync(archiveEntry.GetPhysicalFileFullPath(), cancellationToken);
+            }
+            
             if (imageBytes == null || imageBytes.Length == 0)
             {
                 return null;
@@ -208,6 +256,8 @@ public class MemoryOptimizedImageProcessingService : IImageProcessingService
             
             if (codec == null)
             {
+                _logger.LogWarning("Failed to create codec for {ImagePath}", archiveEntry.GetDisplayPath());
+                ReturnBufferToPool(imageBytes);
                 return null;
             }
 
@@ -222,7 +272,7 @@ public class MemoryOptimizedImageProcessingService : IImageProcessingService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Error getting image dimensions from {ImagePath}", archiveEntry.GetPhysicalFileFullPath());
+            _logger.LogError(ex, "❌ Error getting image dimensions from {ImagePath}", archiveEntry.GetDisplayPath());
             return null;
         }
     }

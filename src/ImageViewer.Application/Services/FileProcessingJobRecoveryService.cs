@@ -248,11 +248,13 @@ public class FileProcessingJobRecoveryService : IFileProcessingJobRecoveryServic
                     ImageId = imageId,
                     CollectionId = jobState.CollectionId,
                     //ImagePath = image.GetFullPath(collection.Path),
-                    ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                    // ✅ FIX: Reuse existing ArchiveEntry from image
+                    ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                         collection.Path, 
                         collection.Type, 
                         image.Filename, 
-                        image.FileSize),
+                        image.FileSize,
+                        image.RelativePath),
                     CachePath = cachePath,
                     CacheWidth = settings.Width,
                     CacheHeight = settings.Height,
@@ -301,11 +303,13 @@ public class FileProcessingJobRecoveryService : IFileProcessingJobRecoveryServic
                     CollectionId = jobState.CollectionId,
                     //ImagePath = image.GetFullPath(collection.Path),
                     //ImageFilename = image.Filename,
-                    ArchiveEntry = ArchiveEntryInfo.FromCollection(
+                    // ✅ FIX: Reuse existing ArchiveEntry from image
+                    ArchiveEntry = image.ArchiveEntry ?? ArchiveEntryInfo.FromCollection(
                         collection.Path, 
                         collection.Type, 
                         image.Filename, 
-                        image.FileSize),
+                        image.FileSize,
+                        image.RelativePath),
                     ThumbnailWidth = settings.Width,
                     ThumbnailHeight = settings.Height
                 };

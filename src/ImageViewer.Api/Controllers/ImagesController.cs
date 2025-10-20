@@ -323,10 +323,12 @@ public class ImagesController : ControllerBase
                 ImageId = imageId,
                 CollectionId = collectionId.ToString(),
                 //ImagePath = imagePath,
-                ArchiveEntry = new ArchiveEntryInfo()
+                // ✅ FIX: Reuse existing ArchiveEntry from image
+                ArchiveEntry = image.ArchiveEntry ?? new ArchiveEntryInfo()
                 {
                     ArchivePath = collection.Path,
-                    EntryName = image.Filename,
+                    EntryName = image.RelativePath,  // ✅ Use RelativePath
+                    EntryPath = image.RelativePath,
                     IsDirectory = Directory.Exists(collection.Path),
                 },
                 CachePath = cachePath,

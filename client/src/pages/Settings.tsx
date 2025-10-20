@@ -12,6 +12,7 @@ import CacheFolderManager from '../components/settings/CacheFolderManager';
 import RedisIndexManagement from '../components/settings/RedisIndexManagement';
 import CollectionCleanup from '../components/settings/CollectionCleanup';
 import MacOSXCleanup from '../components/settings/MacOSXCleanup';
+import ArchiveEntryRepair from '../components/settings/ArchiveEntryRepair';
 import { useUserSettings, useUpdateUserSettings, useResetUserSettings, useSystemSettings, useBatchUpdateSystemSettings } from '../hooks/useSettings';
 import toast from 'react-hot-toast';
 
@@ -676,6 +677,9 @@ const Settings: React.FC = () => {
                   </SettingsSection>
 
                   <RedisIndexManagement />
+
+                  {/* Archive Entry Repair Tool */}
+                  <ArchiveEntryRepair />
 
                   <SettingsSection
                     title="Collection Management"
