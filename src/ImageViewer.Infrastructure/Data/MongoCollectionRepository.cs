@@ -5,6 +5,7 @@ using ImageViewer.Domain.Interfaces;
 using ImageViewer.Domain.Enums;
 using ImageViewer.Domain.Exceptions;
 using ImageViewer.Domain.DTOs;
+using ImageViewer.Domain.ValueObjects;
 
 namespace ImageViewer.Infrastructure.Data;
 
@@ -304,6 +305,56 @@ public class MongoCollectionRepository : MongoRepository<Collection>, ICollectio
     public async Task<bool> AtomicAddCacheImageAsync(ObjectId collectionId, Domain.ValueObjects.CacheImageEmbedded cacheImage)
     {
         var filter = Builders<Collection>.Filter.Eq(x => x.Id, collectionId);
+        var update = Builders<Collection>.Update
+            .Push(x => x.CacheImages, cacheImage)
+            .Set(x => x.UpdatedAt, DateTime.UtcNow);
+        
+        var result = await _collection.UpdateOneAsync(filter, update);
+        return result.ModifiedCount > 0;
+    }
+
+    /// <summary>
+    /// Atomically adds a thumbnail only if it doesn't already exist (prevents duplicates)
+    /// Uses MongoDB query to check for existing records before adding
+    /// </summary>
+    public async Task<bool> AtomicAddThumbnailIfNotExistsAsync(ObjectId collectionId, ThumbnailEmbedded thumbnail)
+    {
+        var filter = Builders<Collection>.Filter.And(
+            Builders<Collection>.Filter.Eq(x => x.Id, collectionId),
+            Builders<Collection>.Filter.Not(
+                Builders<Collection>.Filter.ElemMatch(x => x.Thumbnails, 
+                    Builders<ThumbnailEmbedded>.Filter.And(
+                        Builders<ThumbnailEmbedded>.Filter.Eq(t => t.ImageId, thumbnail.ImageId),
+                        Builders<ThumbnailEmbedded>.Filter.Eq(t => t.Width, thumbnail.Width),
+                        Builders<ThumbnailEmbedded>.Filter.Eq(t => t.Height, thumbnail.Height)
+                    )
+                )
+            )
+        );
+        
+        var update = Builders<Collection>.Update
+            .Push(x => x.Thumbnails, thumbnail)
+            .Set(x => x.UpdatedAt, DateTime.UtcNow);
+        
+        var result = await _collection.UpdateOneAsync(filter, update);
+        return result.ModifiedCount > 0;
+    }
+
+    /// <summary>
+    /// Atomically adds a cache image only if it doesn't already exist (prevents duplicates)
+    /// Uses MongoDB query to check for existing records before adding
+    /// </summary>
+    public async Task<bool> AtomicAddCacheImageIfNotExistsAsync(ObjectId collectionId, CacheImageEmbedded cacheImage)
+    {
+        var filter = Builders<Collection>.Filter.And(
+            Builders<Collection>.Filter.Eq(x => x.Id, collectionId),
+            Builders<Collection>.Filter.Not(
+                Builders<Collection>.Filter.ElemMatch(x => x.CacheImages, 
+                    Builders<CacheImageEmbedded>.Filter.Eq(c => c.ImageId, cacheImage.ImageId)
+                )
+            )
+        );
+        
         var update = Builders<Collection>.Update
             .Push(x => x.CacheImages, cacheImage)
             .Set(x => x.UpdatedAt, DateTime.UtcNow);

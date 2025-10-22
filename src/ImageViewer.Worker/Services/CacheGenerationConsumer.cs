@@ -77,6 +77,7 @@ public class CacheGenerationConsumer : BaseMessageConsumer
             var cacheService = scope.ServiceProvider.GetRequiredService<ICacheService>();
             var collectionRepository = scope.ServiceProvider.GetRequiredService<ICollectionRepository>();
             var settingsService = scope.ServiceProvider.GetRequiredService<IImageProcessingSettingsService>();
+            var backgroundJobService = scope.ServiceProvider.GetRequiredService<IBackgroundJobService>();
             
             // Update progress heartbeat to show job is actively processing
             if (!string.IsNullOrEmpty(cacheMessage.JobId))
@@ -183,9 +184,7 @@ public class CacheGenerationConsumer : BaseMessageConsumer
                     
                     if (existingCache == null)
                     {
-                        // Cache file exists on disk but not in collection - add the entry
-                        _logger.LogInformation("📝 Re-adding existing cache file to collection for image {ImageId}", cacheMessage.ImageId);
-                        
+                        // CRITICAL FIX: Use atomic addToSet to prevent duplicates
                         var fileInfo = new FileInfo(cachePath);
                         var cacheImage = new CacheImageEmbedded(
                             cacheMessage.ImageId,
@@ -197,19 +196,76 @@ public class CacheGenerationConsumer : BaseMessageConsumer
                             cacheMessage.Quality
                         );
                         
-                        await collectionRepository.AtomicAddCacheImageAsync(collectionId, cacheImage);
+                        var wasAdded = false;
+                        try
+                        {
+                            wasAdded = await collectionRepository.AtomicAddCacheImageIfNotExistsAsync(collectionId, cacheImage);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Failed to add cache record to collection for image {ImageId}", cacheMessage.ImageId);
+                            // Continue processing - don't crash the consumer
+                            return;
+                        }
+                        
+                        if (wasAdded)
+                        {
+                            _logger.LogInformation("📝 Re-added existing cache file to collection for image {ImageId}", cacheMessage.ImageId);
+                            
+                            // Track as completed in FileProcessingJobState
+                            if (!string.IsNullOrEmpty(cacheMessage.JobId))
+                            {
+                                try
+                                {
+                                    var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
+                                    await jobStateRepository.AtomicIncrementCompletedAsync(cacheMessage.JobId, cacheMessage.ImageId, fileInfo.Length);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to track completed cache for image {ImageId} in job {JobId}",
+                                        cacheMessage.ImageId, cacheMessage.JobId);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogDebug("📝 Cache record already exists in database for image {ImageId}, skipped re-add", cacheMessage.ImageId);
+                            
+                            // Track as skipped in FileProcessingJobState
+                            if (!string.IsNullOrEmpty(cacheMessage.JobId))
+                            {
+                                try
+                                {
+                                    var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
+                                    await jobStateRepository.AtomicIncrementSkippedAsync(cacheMessage.JobId, cacheMessage.ImageId);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to track skipped cache for image {ImageId} in job {JobId}",
+                                        cacheMessage.ImageId, cacheMessage.JobId);
+                                }
+                            }
+                        }
                     }
                     else
                     {
                         _logger.LogDebug("Cache entry already exists in collection for image {ImageId}, true skip", cacheMessage.ImageId);
+                        
+                        // Track as skipped in FileProcessingJobState
+                        if (!string.IsNullOrEmpty(cacheMessage.JobId))
+                        {
+                            try
+                            {
+                                var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
+                                await jobStateRepository.AtomicIncrementSkippedAsync(cacheMessage.JobId, cacheMessage.ImageId);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to track skipped cache for image {ImageId} in job {JobId}",
+                                    cacheMessage.ImageId, cacheMessage.JobId);
+                            }
+                        }
                     }
-                }
-                
-                // Track as skipped in FileProcessingJobState
-                if (!string.IsNullOrEmpty(cacheMessage.JobId))
-                {
-                    var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
-                    await jobStateRepository.AtomicIncrementSkippedAsync(cacheMessage.JobId, cacheMessage.ImageId);
                 }
                 
                 // CRITICAL: Update job stage progress for skipped files
@@ -307,6 +363,56 @@ public class CacheGenerationConsumer : BaseMessageConsumer
                 }
             }
 
+            // CRITICAL FIX: Check if cache file already exists on disk to prevent duplicate generation
+            if (File.Exists(cachePath))
+            {
+                _logger.LogDebug("📁 Cache file already exists on disk: {CachePath}, skipping generation", cachePath);
+                
+                // Still need to update database and track progress even if file exists
+                await UpdateCacheInfoInDatabase(cacheMessage, cachePath, collectionRepository, backgroundJobService);
+                
+                // Track progress in FileProcessingJobState if jobId is present
+                if (!string.IsNullOrEmpty(cacheMessage.JobId))
+                {
+                    try
+                    {
+                        var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
+                        var fileInfo = new FileInfo(cachePath);
+                        await jobStateRepository.AtomicIncrementCompletedAsync(
+                            cacheMessage.JobId, 
+                            cacheMessage.ImageId, 
+                            fileInfo.Length);
+                        
+                        // Check if job is complete and mark it as finished
+                        await CheckAndMarkJobComplete(cacheMessage.JobId, jobStateRepository);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to track completed cache for image {ImageId} in job {JobId}",
+                            cacheMessage.ImageId, cacheMessage.JobId);
+                    }
+                }
+                
+                // CRITICAL: Update job stage progress for skipped files
+                if (!string.IsNullOrEmpty(cacheMessage.ScanJobId))
+                {
+                    try
+                    {
+                        var bgJobService = scope.ServiceProvider.GetRequiredService<IBackgroundJobService>();
+                        await bgJobService.IncrementJobStageProgressAsync(
+                            ObjectId.Parse(cacheMessage.ScanJobId),
+                            "cache",
+                            incrementBy: 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to update job stage for existing cache {ImageId}", cacheMessage.ImageId);
+                    }
+                }
+                
+                return;
+            }
+
             // Ensure cache directory exists
             var cacheDir = Path.GetDirectoryName(cachePath);
             if (!string.IsNullOrEmpty(cacheDir) && !Directory.Exists(cacheDir))
@@ -322,20 +428,27 @@ public class CacheGenerationConsumer : BaseMessageConsumer
             await UpdateCacheFolderSizeAsync(cachePath, cacheImageData.Length, collectionObjectId);
 
             // Update cache info in database
-            var backgroundJobService = scope.ServiceProvider.GetRequiredService<IBackgroundJobService>();
             await UpdateCacheInfoInDatabase(cacheMessage, cachePath, collectionRepository, backgroundJobService);
             
             // Track progress in FileProcessingJobState if jobId is present
             if (!string.IsNullOrEmpty(cacheMessage.JobId))
             {
-                var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
-                await jobStateRepository.AtomicIncrementCompletedAsync(
-                    cacheMessage.JobId, 
-                    cacheMessage.ImageId, 
-                    cacheImageData.Length);
-                
-                // Check if job is complete and mark it as finished
-                await CheckAndMarkJobComplete(cacheMessage.JobId, jobStateRepository);
+                try
+                {
+                    var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
+                    await jobStateRepository.AtomicIncrementCompletedAsync(
+                        cacheMessage.JobId, 
+                        cacheMessage.ImageId, 
+                        cacheImageData.Length);
+                    
+                    // Check if job is complete and mark it as finished
+                    await CheckAndMarkJobComplete(cacheMessage.JobId, jobStateRepository);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to track completed cache for image {ImageId} in job {JobId}",
+                        cacheMessage.ImageId, cacheMessage.JobId);
+                }
             }
 
             _logger.LogDebug("✅ Cache generated for image {ImageId} at path {CachePath} with dimensions {Width}x{Height}", 

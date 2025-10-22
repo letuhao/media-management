@@ -385,6 +385,21 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
                 format,
                 collectionDir);
             
+            // CRITICAL FIX: Check if thumbnail file already exists on disk to prevent duplicate generation
+            if (File.Exists(thumbnailPath))
+            {
+                _logger.LogDebug("📁 Thumbnail file already exists on disk: {ThumbnailPath}, skipping generation", thumbnailPath);
+                
+                // Still add to results for database update
+                thumbnailPaths.Add(new ThumbnailPathData
+                {
+                    ImageId = processedImage.Message.ImageId,
+                    ThumbnailPath = thumbnailPath,
+                    Size = new FileInfo(thumbnailPath).Length
+                });
+                continue;
+            }
+            
             // Ensure the directory exists before writing the file
             var directory = Path.GetDirectoryName(thumbnailPath);
             if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
@@ -494,25 +509,56 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
                 
                 if (!string.IsNullOrEmpty(thumbnailPath) && File.Exists(thumbnailPath))
                 {
-                    _logger.LogInformation("📝 Resume Incomplete: Thumbnail file exists on disk but not in collection for image {ImageId}, will re-add", message.ImageId);
+                    // CRITICAL FIX: Double-check if thumbnail record exists to prevent duplicates
+                    // This prevents race conditions where multiple consumers process the same image
+                    var doubleCheckCollection = await collectionRepository.GetByIdAsync(collectionId);
+                    var doubleCheckThumbnail = doubleCheckCollection?.Thumbnails?.FirstOrDefault(t =>
+                        t.ImageId == message.ImageId &&
+                        t.Width == message.ThumbnailWidth &&
+                        t.Height == message.ThumbnailHeight);
                     
-                    // Re-add the existing thumbnail file to collection
-                    var fileInfo = new FileInfo(thumbnailPath);
-                    // ✅ FIX: Load quality from settings instead of hardcoding 95
-                    var qualitySetting = await settingsService.GetThumbnailQualityAsync();
+                    if (doubleCheckThumbnail == null)
+                    {
+                        _logger.LogInformation("📝 Resume Incomplete: Thumbnail file exists on disk but not in collection for image {ImageId}, will re-add", message.ImageId);
+                        
+                        // Re-add the existing thumbnail file to collection
+                        var fileInfo = new FileInfo(thumbnailPath);
+                        // ✅ FIX: Load quality from settings instead of hardcoding 95
+                        var qualitySetting = await settingsService.GetThumbnailQualityAsync();
+                        
+                        var thumbnailEmbedded = new ThumbnailEmbedded(
+                            message.ImageId,
+                            thumbnailPath,
+                            message.ThumbnailWidth,
+                            message.ThumbnailHeight,
+                            fileInfo.Length,
+                            fileInfo.Extension.TrimStart('.').ToUpperInvariant(),
+                            qualitySetting // Load from settings
+                        );
+                        
+                        var wasAdded = false;
+                        try
+                        {
+                            wasAdded = await collectionRepository.AtomicAddThumbnailIfNotExistsAsync(collectionId, thumbnailEmbedded);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Failed to add thumbnail record to collection for image {ImageId}", message.ImageId);
+                            // Continue processing - don't crash the consumer
+                            return true; // Skip processing since we can't add to database
+                        }
+                        
+                        if (!wasAdded)
+                        {
+                            _logger.LogDebug("📝 Thumbnail record already exists in database for image {ImageId}, skipped re-add", message.ImageId);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogDebug("📝 Thumbnail record already exists in database for image {ImageId}, skipping re-add", message.ImageId);
+                    }
                     
-                    var thumbnailEmbedded = new ThumbnailEmbedded(
-                        message.ImageId,
-                        thumbnailPath,
-                        message.ThumbnailWidth,
-                        message.ThumbnailHeight,
-                        fileInfo.Length,
-                        fileInfo.Extension.TrimStart('.').ToUpperInvariant(),
-                        qualitySetting // Load from settings
-                    );
-                    
-                    await collectionRepository.AtomicAddThumbnailAsync(collectionId, thumbnailEmbedded);
-                    return true; // Skip processing since we just re-added it
+                    return true; // Skip processing since file exists
                 }
             }
             
@@ -548,8 +594,16 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
                 
                 if (!string.IsNullOrEmpty(message.JobId))
                 {
-                    await jobStateRepository.AtomicIncrementCompletedAsync(
-                        message.JobId, message.ImageId, 0);
+                    try
+                    {
+                        await jobStateRepository.AtomicIncrementCompletedAsync(
+                            message.JobId, message.ImageId, 0);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to track completed thumbnail for image {ImageId} in job {JobId}",
+                            message.ImageId, message.JobId);
+                    }
                 }
             }
             
@@ -558,13 +612,29 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
             {
                 if (!string.IsNullOrEmpty(message.ScanJobId))
                 {
-                    await backgroundJobService.IncrementJobStageProgressAsync(
-                        ObjectId.Parse(message.ScanJobId), "thumbnail", incrementBy: 1);
+                    try
+                    {
+                        await backgroundJobService.IncrementJobStageProgressAsync(
+                            ObjectId.Parse(message.ScanJobId), "thumbnail", incrementBy: 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to update job stage progress for failed image {ImageId} in job {JobId}",
+                            message.ImageId, message.ScanJobId);
+                    }
                 }
                 
                 if (!string.IsNullOrEmpty(message.JobId))
                 {
-                    await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    try
+                    {
+                        await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to track failed thumbnail for image {ImageId} in job {JobId}",
+                            message.ImageId, message.JobId);
+                    }
                 }
                 
                 _logger.LogDebug("✅ Marked failed thumbnail image {ImageId} as done to avoid retrying", message.ImageId);
@@ -781,14 +851,30 @@ public class BatchThumbnailGenerationConsumer : BaseMessageConsumer
                 // Mark as completed in scan job (so it doesn't retry)
                 if (!string.IsNullOrEmpty(message.ScanJobId))
                 {
-                    await backgroundJobService.IncrementJobStageProgressAsync(
-                        ObjectId.Parse(message.ScanJobId), "thumbnail", incrementBy: 1);
+                    try
+                    {
+                        await backgroundJobService.IncrementJobStageProgressAsync(
+                            ObjectId.Parse(message.ScanJobId), "thumbnail", incrementBy: 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to update job stage progress for failed image {ImageId} in job {JobId}",
+                            message.ImageId, message.ScanJobId);
+                    }
                 }
                 
                 // Mark as failed in job state (so it's counted as processed)
                 if (!string.IsNullOrEmpty(message.JobId))
                 {
-                    await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    try
+                    {
+                        await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to track failed thumbnail for image {ImageId} in job {JobId}",
+                            message.ImageId, message.JobId);
+                    }
                 }
                 
                 _logger.LogDebug("✅ Marked failed thumbnail image {ImageId} as done to avoid retrying", message.ImageId);

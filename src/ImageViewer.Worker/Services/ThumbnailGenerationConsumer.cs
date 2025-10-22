@@ -71,6 +71,7 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
             var imageProcessingService = scope.ServiceProvider.GetRequiredService<IImageProcessingService>();
             var collectionRepository = scope.ServiceProvider.GetRequiredService<ICollectionRepository>();
             var settingsService = scope.ServiceProvider.GetRequiredService<IImageProcessingSettingsService>();
+            var backgroundJobService = scope.ServiceProvider.GetRequiredService<IBackgroundJobService>();
 
             // Update progress heartbeat to show job is actively processing
             if (!string.IsNullOrEmpty(thumbnailMessage.JobId))
@@ -182,7 +183,6 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                     {
                         try
                         {
-                            var backgroundJobService = scope.ServiceProvider.GetRequiredService<IBackgroundJobService>();
                             await backgroundJobService.IncrementJobStageProgressAsync(
                                 ObjectId.Parse(thumbnailMessage.ScanJobId),
                                 "thumbnail",
@@ -210,11 +210,9 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                     
                     if (!string.IsNullOrEmpty(thumbnailPath) && File.Exists(thumbnailPath))
                     {
-                        _logger.LogInformation("📝 Re-adding existing thumbnail file to collection for image {ImageId}", thumbnailMessage.ImageId);
-                        
-                        // Thumbnail file exists on disk but not in collection - add the entry
+                        // CRITICAL FIX: Use MongoDB's $addToSet to prevent duplicates atomically
+                        // This is the safest approach - MongoDB handles the duplicate check atomically
                         var fileInfo = new FileInfo(thumbnailPath);
-                        // ✅ FIX: Load quality from settings instead of hardcoding 95
                         var qualitySetting = await settingsService.GetThumbnailQualityAsync();
                         
                         var thumbnailEmbedded = new ThumbnailEmbedded(
@@ -224,23 +222,58 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                             thumbnailMessage.ThumbnailHeight,
                             fileInfo.Length,
                             fileInfo.Extension.TrimStart('.').ToUpperInvariant(),
-                            qualitySetting // Load from settings
+                            qualitySetting
                         );
                         
-                        await collectionRepository.AtomicAddThumbnailAsync(collectionId, thumbnailEmbedded);
-                        
-                        // Track as skipped in FileProcessingJobState
-                        if (!string.IsNullOrEmpty(thumbnailMessage.JobId))
+                        // Use atomic query to prevent duplicates
+                        bool wasAdded = false;
+                        try
                         {
-                            try
+                            wasAdded = await collectionRepository.AtomicAddThumbnailIfNotExistsAsync(collectionId, thumbnailEmbedded);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Failed to add thumbnail record to collection for image {ImageId}", thumbnailMessage.ImageId);
+                            // Continue processing - don't crash the consumer
+                            return;
+                        }
+                        
+                        if (wasAdded)
+                        {
+                            _logger.LogInformation("📝 Re-added existing thumbnail file to collection for image {ImageId}", thumbnailMessage.ImageId);
+                            
+                            // Track as completed in FileProcessingJobState
+                            if (!string.IsNullOrEmpty(thumbnailMessage.JobId))
                             {
-                                var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
-                                await jobStateRepository.AtomicIncrementSkippedAsync(thumbnailMessage.JobId, thumbnailMessage.ImageId);
+                                try
+                                {
+                                    var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
+                                    await jobStateRepository.AtomicIncrementCompletedAsync(thumbnailMessage.JobId, thumbnailMessage.ImageId, fileInfo.Length);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to track completed thumbnail for image {ImageId} in job {JobId}",
+                                        thumbnailMessage.ImageId, thumbnailMessage.JobId);
+                                }
                             }
-                            catch (Exception ex)
+                        }
+                        else
+                        {
+                            _logger.LogDebug("📝 Thumbnail record already exists in database for image {ImageId}, skipped re-add", thumbnailMessage.ImageId);
+                            
+                            // Track as skipped in FileProcessingJobState
+                            if (!string.IsNullOrEmpty(thumbnailMessage.JobId))
                             {
-                                _logger.LogWarning(ex, "Failed to track skipped thumbnail for image {ImageId} in job {JobId}",
-                                    thumbnailMessage.ImageId, thumbnailMessage.JobId);
+                                try
+                                {
+                                    var jobStateRepository = scope.ServiceProvider.GetRequiredService<IFileProcessingJobStateRepository>();
+                                    await jobStateRepository.AtomicIncrementSkippedAsync(thumbnailMessage.JobId, thumbnailMessage.ImageId);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to track skipped thumbnail for image {ImageId} in job {JobId}",
+                                        thumbnailMessage.ImageId, thumbnailMessage.JobId);
+                                }
                             }
                         }
                         
@@ -249,7 +282,6 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                         {
                             try
                             {
-                                var backgroundJobService = scope.ServiceProvider.GetRequiredService<IBackgroundJobService>();
                                 await backgroundJobService.IncrementJobStageProgressAsync(
                                     ObjectId.Parse(thumbnailMessage.ScanJobId),
                                     "thumbnail",
@@ -288,7 +320,6 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
                     {
                         try
                         {
-                            var backgroundJobService = scope.ServiceProvider.GetRequiredService<IBackgroundJobService>();
                             await backgroundJobService.IncrementJobStageProgressAsync(
                                 ObjectId.Parse(thumbnailMessage.ScanJobId),
                                 "thumbnail",
@@ -481,6 +512,13 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
             
             // Determine thumbnail path (with correct format extension)
             var thumbnailPath = await GetThumbnailPath(archiveEntry, width, height, collectionId, format);
+            
+            // CRITICAL FIX: Check if thumbnail file already exists on disk to prevent duplicate generation
+            if (File.Exists(thumbnailPath))
+            {
+                _logger.LogDebug("📁 Thumbnail file already exists on disk: {ThumbnailPath}, skipping generation", thumbnailPath);
+                return thumbnailPath; // Return existing path without regenerating
+            }
             
             // Ensure thumbnail directory exists
             var thumbnailDir = Path.GetDirectoryName(thumbnailPath);

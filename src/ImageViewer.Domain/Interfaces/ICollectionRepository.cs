@@ -81,6 +81,18 @@ public interface ICollectionRepository : IRepository<Collection>
     Task<bool> AtomicAddCacheImagesAsync(ObjectId collectionId, IEnumerable<CacheImageEmbedded> cacheImages);
     
     /// <summary>
+    /// Atomically adds a thumbnail only if it doesn't already exist (prevents duplicates)
+    /// Uses MongoDB's $addToSet operator for atomic duplicate prevention
+    /// </summary>
+    Task<bool> AtomicAddThumbnailIfNotExistsAsync(ObjectId collectionId, ThumbnailEmbedded thumbnail);
+    
+    /// <summary>
+    /// Atomically adds a cache image only if it doesn't already exist (prevents duplicates)
+    /// Uses MongoDB's $addToSet operator for atomic duplicate prevention
+    /// </summary>
+    Task<bool> AtomicAddCacheImageIfNotExistsAsync(ObjectId collectionId, CacheImageEmbedded cacheImage);
+    
+    /// <summary>
     /// Clears all image arrays (Images, Thumbnails, CacheImages) for a collection
     /// Used for force rescan to start fresh
     /// </summary>

@@ -468,6 +468,21 @@ public class BatchCacheGenerationConsumer : BaseMessageConsumer
         {
             var cachePath = processedImage.Message.CachePath;
             
+            // CRITICAL FIX: Check if cache file already exists on disk to prevent duplicate generation
+            if (File.Exists(cachePath))
+            {
+                _logger.LogDebug("📁 Cache file already exists on disk: {CachePath}, skipping generation", cachePath);
+                
+                // Still add to results for database update
+                cachePaths.Add(new CachePathData
+                {
+                    ImageId = processedImage.Message.ImageId,
+                    CachePath = cachePath,
+                    Size = new FileInfo(cachePath).Length
+                });
+                continue;
+            }
+            
             // Ensure the directory exists before writing the file
             var directory = Path.GetDirectoryName(cachePath);
             if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
@@ -553,22 +568,50 @@ public class BatchCacheGenerationConsumer : BaseMessageConsumer
             // Check if cache file exists on disk
             if (File.Exists(message.CachePath))
             {
-                _logger.LogDebug("📁 Cache file already exists on disk for image {ImageId}, re-adding to collection", message.ImageId);
+                // CRITICAL FIX: Double-check if cache record exists to prevent duplicates
+                // This prevents race conditions where multiple consumers process the same image
+                var doubleCheckCollection = await collectionRepository.GetByIdAsync(collectionId);
+                var doubleCheckCache = doubleCheckCollection?.CacheImages?.FirstOrDefault(c => c.ImageId == message.ImageId);
                 
-                // Re-add the existing cache file to collection
-                var fileInfo = new FileInfo(message.CachePath);
-                var cacheEmbedded = new CacheImageEmbedded(
-                    message.ImageId,
-                    message.CachePath,
-                    message.CacheWidth,
-                    message.CacheHeight,
-                    fileInfo.Length,
-                    message.Format.ToUpperInvariant(),
-                    message.Quality
-                );
+                if (doubleCheckCache == null)
+                {
+                    _logger.LogDebug("📁 Cache file already exists on disk for image {ImageId}, re-adding to collection", message.ImageId);
+                    
+                    // Re-add the existing cache file to collection
+                    var fileInfo = new FileInfo(message.CachePath);
+                    var cacheEmbedded = new CacheImageEmbedded(
+                        message.ImageId,
+                        message.CachePath,
+                        message.CacheWidth,
+                        message.CacheHeight,
+                        fileInfo.Length,
+                        message.Format.ToUpperInvariant(),
+                        message.Quality
+                    );
+                    
+                    var wasAdded = false;
+                    try
+                    {
+                        wasAdded = await collectionRepository.AtomicAddCacheImageIfNotExistsAsync(collectionId, cacheEmbedded);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to add cache record to collection for image {ImageId}", message.ImageId);
+                        // Continue processing - don't crash the consumer
+                        return true; // Skip processing since we can't add to database
+                    }
+                    
+                    if (!wasAdded)
+                    {
+                        _logger.LogDebug("📝 Cache record already exists in database for image {ImageId}, skipped re-add", message.ImageId);
+                    }
+                }
+                else
+                {
+                    _logger.LogDebug("📝 Cache record already exists in database for image {ImageId}, skipping re-add", message.ImageId);
+                }
                 
-                await collectionRepository.AtomicAddCacheImageAsync(collectionId, cacheEmbedded);
-                return true; // Skip processing since we just re-added it
+                return true; // Skip processing since file exists
             }
             
             return false;
@@ -597,14 +640,30 @@ public class BatchCacheGenerationConsumer : BaseMessageConsumer
                 var message = processedImage.Message;
                 if (!string.IsNullOrEmpty(message.ScanJobId))
                 {
-                    await backgroundJobService.IncrementJobStageProgressAsync(
-                        ObjectId.Parse(message.ScanJobId), "cache", incrementBy: 1);
+                    try
+                    {
+                        await backgroundJobService.IncrementJobStageProgressAsync(
+                            ObjectId.Parse(message.ScanJobId), "cache", incrementBy: 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to update job stage progress for image {ImageId} in job {JobId}",
+                            message.ImageId, message.ScanJobId);
+                    }
                 }
                 
                 if (!string.IsNullOrEmpty(message.JobId))
                 {
-                    await jobStateRepository.AtomicIncrementCompletedAsync(
-                        message.JobId, message.ImageId, 0);
+                    try
+                    {
+                        await jobStateRepository.AtomicIncrementCompletedAsync(
+                            message.JobId, message.ImageId, 0);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to track completed cache for image {ImageId} in job {JobId}",
+                            message.ImageId, message.JobId);
+                    }
                 }
             }
             
@@ -613,13 +672,29 @@ public class BatchCacheGenerationConsumer : BaseMessageConsumer
             {
                 if (!string.IsNullOrEmpty(message.ScanJobId))
                 {
-                    await backgroundJobService.IncrementJobStageProgressAsync(
-                        ObjectId.Parse(message.ScanJobId), "cache", incrementBy: 1);
+                    try
+                    {
+                        await backgroundJobService.IncrementJobStageProgressAsync(
+                            ObjectId.Parse(message.ScanJobId), "cache", incrementBy: 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to update job stage progress for failed image {ImageId} in job {JobId}",
+                            message.ImageId, message.ScanJobId);
+                    }
                 }
                 
                 if (!string.IsNullOrEmpty(message.JobId))
                 {
-                    await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    try
+                    {
+                        await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to track failed cache for image {ImageId} in job {JobId}",
+                            message.ImageId, message.JobId);
+                    }
                 }
                 
                 _logger.LogDebug("✅ Marked failed cache image {ImageId} as done to avoid retrying", message.ImageId);
@@ -955,14 +1030,30 @@ public class BatchCacheGenerationConsumer : BaseMessageConsumer
                 // Mark as completed in scan job (so it doesn't retry)
                 if (!string.IsNullOrEmpty(message.ScanJobId))
                 {
-                    await backgroundJobService.IncrementJobStageProgressAsync(
-                        ObjectId.Parse(message.ScanJobId), "cache", incrementBy: 1);
+                    try
+                    {
+                        await backgroundJobService.IncrementJobStageProgressAsync(
+                            ObjectId.Parse(message.ScanJobId), "cache", incrementBy: 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to update job stage progress for failed image {ImageId} in job {JobId}",
+                            message.ImageId, message.ScanJobId);
+                    }
                 }
                 
                 // Mark as failed in job state (so it's counted as processed)
                 if (!string.IsNullOrEmpty(message.JobId))
                 {
-                    await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    try
+                    {
+                        await jobStateRepository.AtomicIncrementFailedAsync(message.JobId, message.ImageId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to track failed cache for image {ImageId} in job {JobId}",
+                            message.ImageId, message.JobId);
+                    }
                 }
                 
                 _logger.LogDebug("✅ Marked failed cache image {ImageId} as done to avoid retrying", message.ImageId);
