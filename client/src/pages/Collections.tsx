@@ -47,11 +47,15 @@ const Collections: React.FC = () => {
   // Restore page and search from sessionStorage when returning to this screen
   const [page, setPage] = useState(() => {
     const savedPage = sessionStorage.getItem('collectionsCurrentPage');
-    return savedPage ? parseInt(savedPage) : 1;
+    const parsedPage = savedPage ? parseInt(savedPage) : 1;
+    console.log(`[Collections] Restoring page from sessionStorage: ${parsedPage}`);
+    return parsedPage;
   });
   
   const [search, setSearch] = useState(() => {
-    return sessionStorage.getItem('collectionsSearchQuery') || '';
+    const savedSearch = sessionStorage.getItem('collectionsSearchQuery') || '';
+    console.log(`[Collections] Restoring search from sessionStorage: "${savedSearch}"`);
+    return savedSearch;
   });
   
   // Debounced search for API - only send after user stops typing
@@ -59,6 +63,7 @@ const Collections: React.FC = () => {
   
   useEffect(() => {
     const timer = setTimeout(() => {
+      console.log(`[Collections] Setting debounced search: "${search}"`);
       setDebouncedSearch(search);
     }, 300); // Wait 300ms after user stops typing
     
@@ -134,13 +139,30 @@ const Collections: React.FC = () => {
     }
   }, [data?.total]);
 
-  // Reset to page 1 when debounced search changes
+  // Reset to page 1 when debounced search changes (but not on initial load)
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [previousDebouncedSearch, setPreviousDebouncedSearch] = useState(debouncedSearch);
+  
   useEffect(() => {
-    setPage(1);
-  }, [debouncedSearch]);
+    // Skip if this is the initial load
+    if (isInitialLoad) {
+      console.log(`[Collections] Initial load, skipping page reset. Current page: ${page}`);
+      setIsInitialLoad(false);
+      setPreviousDebouncedSearch(debouncedSearch);
+      return;
+    }
+    
+    // Only reset if the search actually changed (not just initialized)
+    if (debouncedSearch !== previousDebouncedSearch) {
+      console.log(`[Collections] Search changed from "${previousDebouncedSearch}" to "${debouncedSearch}", resetting page to 1. Previous page: ${page}`);
+      setPage(1);
+      setPreviousDebouncedSearch(debouncedSearch);
+    }
+  }, [debouncedSearch, isInitialLoad, previousDebouncedSearch]);
 
   // Save current page to sessionStorage whenever it changes
   useEffect(() => {
+    console.log(`[Collections] Saving page to sessionStorage: ${page}`);
     sessionStorage.setItem('collectionsCurrentPage', page.toString());
   }, [page]);
 

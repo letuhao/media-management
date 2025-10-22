@@ -44,12 +44,9 @@ const CollectionDetail: React.FC = () => {
   // Random navigation (hotkey registered in Header only to avoid double-call)
   const { handleRandom, isLoading: isRandomLoading } = useRandomNavigation(true, false);
   
-  // Restore page from sessionStorage for THIS specific collection
+  // Always start at page 1 for each collection (no persistence across collections)
   const sessionKey = `collectionDetail_${id}_page`;
-  const [page, setPage] = useState(() => {
-    const savedPage = sessionStorage.getItem(sessionKey);
-    return savedPage ? parseInt(savedPage) : 1;
-  });
+  const [page, setPage] = useState(1);
   
   // Get user settings from backend
   const { data: userSettingsData, refetch: refetchSettings } = useUserSettings();
@@ -98,10 +95,17 @@ const CollectionDetail: React.FC = () => {
   const { data: collectionNav } = useCollectionNavigation(id!, 'updatedAt', 'desc');
 
 
+  // Reset page to 1 when collection ID changes
+  useEffect(() => {
+    console.log(`[CollectionDetail] Collection ID changed to ${id}, resetting page to 1`);
+    setPage(1);
+  }, [id]);
+
   // Save current page to sessionStorage whenever it changes (per collection)
   useEffect(() => {
+    console.log(`[CollectionDetail] Saving page ${page} for collection ${id}`);
     sessionStorage.setItem(sessionKey, page.toString());
-  }, [page, sessionKey]);
+  }, [page, sessionKey, id]);
 
   // Restore scroll position when returning to this collection
   useEffect(() => {
