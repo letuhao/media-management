@@ -179,8 +179,11 @@ public class CacheGenerationConsumer : BaseMessageConsumer
                 
                 if (collection != null)
                 {
-                    // Check if cache entry already exists in collection
-                    var existingCache = collection.CacheImages?.FirstOrDefault(c => c.ImageId == cacheMessage.ImageId);
+                    // Check if cache entry already exists in collection (using composite key: ImageId + Width + Height)
+                    var existingCache = collection.CacheImages?.FirstOrDefault(c => 
+                        c.ImageId == cacheMessage.ImageId &&
+                        c.Width == cacheMessage.CacheWidth &&
+                        c.Height == cacheMessage.CacheHeight);
                     
                     if (existingCache == null)
                     {

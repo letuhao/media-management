@@ -38,8 +38,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
         try
         {
-            // Generate Redis cache key
-            var cacheKey = _imageCacheService.GetThumbnailCacheKey(collectionId, thumbnail.Id);
+            // Generate a stable Redis cache key independent of thumbnail.Id
+            // Use composite key: collectionId + imageId + size
+            var cacheKey = $"collection_index:thumb:{collectionId}:{thumbnail.ImageId}:{thumbnail.Width}x{thumbnail.Height}";
 
             // Try to get from Redis cache
             var cachedBytes = await _imageCacheService.GetCachedImageAsync(cacheKey, cancellationToken);

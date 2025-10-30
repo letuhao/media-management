@@ -9,6 +9,7 @@ namespace ImageViewer.Domain.ValueObjects;
 /// Embedded cache image value object for MongoDB collections
 /// Stores generated cache files separately from source images
 /// </summary>
+[BsonIgnoreExtraElements]
 public class CacheImageEmbedded
 {
     [BsonId]

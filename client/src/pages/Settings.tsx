@@ -693,6 +693,42 @@ const Settings: React.FC = () => {
                     description="Clean up system files and metadata"
                   >
                     <MacOSXCleanup />
+                    {/* Deduplication of thumbnails/cache */}
+                    <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700 mt-4">
+                      <h4 className="text-lg font-semibold text-white mb-2">Deduplicate Thumbnails and Cache</h4>
+                      <p className="text-sm text-slate-400 mb-4">
+                        Remove duplicate entries in collection thumbnails and cache images. This is safe and does not delete files on disk.
+                      </p>
+                      <Button
+                        variant="secondary"
+                        onClick={async () => {
+                          if (!window.confirm('This will deduplicate thumbnails and cache across all collections. Continue?')) {
+                            return;
+                          }
+                          try {
+                            const response = await fetch('/api/v1/admin/dedupe-cache-thumbnails', {
+                              method: 'POST',
+                              headers: {
+                                'Authorization': `Bearer ${localStorage.getItem('auth_token')}`,
+                                'Content-Type': 'application/json',
+                              },
+                            });
+                            if (response.ok) {
+                              const result = await response.json();
+                              toast.success(`Deduped ${result.collectionsProcessed} collections. Removed ${result.totalThumbsRemoved} thumbnails and ${result.totalCachesRemoved} cache entries.`);
+                            } else {
+                              throw new Error('Failed to run deduplication');
+                            }
+                          } catch (error) {
+                            console.error('Error running deduplication:', error);
+                            toast.error('Failed to deduplicate thumbnails/cache');
+                          }
+                        }}
+                        className="w-full"
+                      >
+                        Deduplicate Thumbnails & Cache
+                      </Button>
+                    </div>
                   </SettingsSection>
 
                   <SettingsSection

@@ -322,10 +322,45 @@ public class CollectionsController : ControllerBase
                 UpdatedAt = summary.UpdatedAt,
                 ThumbnailPath = summary.FirstImageThumbnailUrl,
                 ThumbnailImageId = summary.FirstImageId,
-                HasThumbnail = !string.IsNullOrEmpty(summary.ThumbnailBase64),
+                HasThumbnail = summary.ThumbnailCount > 0,
                 FirstImageId = summary.FirstImageId,
                 ThumbnailBase64 = summary.ThumbnailBase64 // ✅ Already pre-cached in Redis!
             }).ToList();
+            
+            // Fallback: If Redis summary is missing thumbnail path but collection has thumbnails, load from live collection
+            for (int index = 0; index < overviewDtos.Count; index++)
+            {
+                var summary = pageResult.Collections[index];
+                var dto = overviewDtos[index];
+                
+                // Prefer Redis summary path; fallback to live collection if missing
+                string? path = summary.FirstImageThumbnailUrl;
+                string? imageId = summary.FirstImageId;
+
+                if (string.IsNullOrEmpty(path) && summary.ThumbnailCount > 0)
+                {
+                    try
+                    {
+                        // Fallback: load collection and get first thumbnail
+                        if (MongoDB.Bson.ObjectId.TryParse(summary.Id, out var colId))
+                        {
+                            var collection = await _collectionService.GetCollectionByIdAsync(colId);
+                            var firstThumb = collection?.Thumbnails?.FirstOrDefault();
+                            if (firstThumb != null)
+                            {
+                                path = firstThumb.ThumbnailPath;
+                                imageId = firstThumb.ImageId;
+                                dto.ThumbnailPath = path;
+                                dto.ThumbnailImageId = imageId;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Fallback load of thumbnail failed for collection {CollectionId}", summary.Id);
+                    }
+                }
+            }
             
             _logger.LogDebug("Returned {Count} collections with {ThumbnailCount} pre-cached thumbnails (search: {Search})", 
                 overviewDtos.Count, overviewDtos.Count(d => d.ThumbnailBase64 != null), search ?? "none");

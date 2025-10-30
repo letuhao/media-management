@@ -148,7 +148,7 @@ public class ThumbnailGenerationConsumer : BaseMessageConsumer
             // Get format from settings (needed for thumbnail path calculation)
             var format = await settingsService.GetThumbnailFormatAsync();
             
-            // Check if thumbnail already exists in database
+            // Check if thumbnail already exists in database (using composite key: ImageId + Width + Height)
             var collectionId = ObjectId.Parse(thumbnailMessage.CollectionId);
             var collection = await collectionRepository.GetByIdAsync(collectionId);
             if (collection != null)

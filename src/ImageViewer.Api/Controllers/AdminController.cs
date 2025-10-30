@@ -1,4 +1,5 @@
 using ImageViewer.Domain.Interfaces;
+using ImageViewer.Application.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -14,15 +15,18 @@ public class AdminController : ControllerBase
 {
     private readonly IMetadataRecalculationService _metadataRecalculationService;
     private readonly ICollectionIndexService _collectionIndexService;
+    private readonly ICacheCleanupService _cacheCleanupService;
     private readonly ILogger<AdminController> _logger;
 
     public AdminController(
         IMetadataRecalculationService metadataRecalculationService,
         ICollectionIndexService collectionIndexService,
+        ICacheCleanupService cacheCleanupService,
         ILogger<AdminController> logger)
     {
         _metadataRecalculationService = metadataRecalculationService;
         _collectionIndexService = collectionIndexService;
+        _cacheCleanupService = cacheCleanupService;
         _logger = logger;
     }
 
@@ -288,6 +292,53 @@ public class AdminController : ControllerBase
         {
             _logger.LogError(ex, "❌ Failed to fix archive entries");
             return StatusCode(500, new { message = "Failed to fix archive entries", error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Deduplicate thumbnails and cache entries for all collections
+    /// 去重所有集合的缩略图和缓存 - Khử trùng lặp thumbnail và cache cho tất cả collection
+    /// </summary>
+    [HttpPost("dedupe-cache-thumbnails")]
+    [ProducesResponseType(typeof(ImageViewer.Application.DTOs.Maintenance.DeduplicationSummaryDto), 200)]
+    public async Task<IActionResult> DedupeAll()
+    {
+        try
+        {
+            _logger.LogInformation("🧹 Admin requested deduplication of thumbnails and cache entries (global)");
+            var summary = await _cacheCleanupService.DeduplicateAllCollectionsAsync();
+            return Ok(summary);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error during global deduplication");
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Deduplicate thumbnails and cache entries for a specific collection
+    /// 去重特定集合的缩略图和缓存 - Khử trùng lặp thumbnail và cache cho collection cụ thể
+    /// </summary>
+    [HttpPost("collections/{collectionId}/dedupe-cache-thumbnails")]
+    [ProducesResponseType(typeof(object), 200)]
+    public async Task<IActionResult> DedupeCollection(string collectionId)
+    {
+        try
+        {
+            var objectId = MongoDB.Bson.ObjectId.Parse(collectionId);
+            _logger.LogInformation("🧹 Admin requested deduplication for collection {CollectionId}", collectionId);
+            var result = await _cacheCleanupService.DeduplicateCollectionAsync(objectId);
+            return Ok(new {
+                success = true,
+                removedThumbnails = result.removedThumbnails,
+                removedCacheImages = result.removedCacheImages
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error during collection deduplication for {CollectionId}", collectionId);
+            return StatusCode(500, new { message = "Internal server error", error = ex.Message });
         }
     }
 }

@@ -8,6 +8,7 @@ namespace ImageViewer.Domain.ValueObjects;
 /// <summary>
 /// Embedded thumbnail value object for MongoDB collections
 /// </summary>
+[BsonIgnoreExtraElements]
 public class ThumbnailEmbedded
 {
     [BsonId]

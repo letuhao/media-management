@@ -270,5 +270,119 @@ public class CacheCleanupService : ICacheCleanupService
             _logger.LogError(ex, "Error reconciling cache folder statistics");
         }
     }
+
+    /// <summary>
+    /// Deduplicate thumbnails and cacheImages arrays for a single collection by composite keys
+    /// / Khử trùng lặp mảng thumbnails và cacheImages cho một collection bằng composite key
+    /// </summary>
+    public async Task<(int removedThumbnails, int removedCacheImages)> DeduplicateCollectionAsync(MongoDB.Bson.ObjectId collectionId)
+    {
+        var collection = await _collectionRepository.GetByIdAsync(collectionId);
+        if (collection == null)
+        {
+            _logger.LogWarning("Collection {CollectionId} not found for deduplication", collectionId);
+            return (0, 0);
+        }
+
+        var originalThumbs = collection.Thumbnails?.ToList() ?? new List<Domain.ValueObjects.ThumbnailEmbedded>();
+        var originalCaches = collection.CacheImages?.ToList() ?? new List<Domain.ValueObjects.CacheImageEmbedded>();
+
+        var distinctThumbs = originalThumbs
+            .GroupBy(t => new { t.ImageId, t.Width, t.Height })
+            .Select(g => g.First())
+            .ToList();
+
+        var distinctCaches = originalCaches
+            .GroupBy(c => new { c.ImageId, c.Width, c.Height })
+            .Select(g => g.First())
+            .ToList();
+
+        var removedThumbnails = originalThumbs.Count - distinctThumbs.Count;
+        var removedCacheImages = originalCaches.Count - distinctCaches.Count;
+
+        if (removedThumbnails > 0 || removedCacheImages > 0)
+        {
+            collection.Thumbnails = distinctThumbs;
+            collection.CacheImages = distinctCaches;
+            collection.UpdatedAt = DateTime.UtcNow;
+            await _collectionRepository.UpdateAsync(collection);
+            _logger.LogInformation("🧹 Deduplicated collection {CollectionId}: removed {Thumbs} thumbnails, {Caches} cache entries",
+                collectionId, removedThumbnails, removedCacheImages);
+        }
+
+        return (removedThumbnails, removedCacheImages);
+    }
+
+    /// <summary>
+    /// Deduplicate thumbnails and cacheImages across all collections.
+    /// / Khử trùng lặp thumbnails và cacheImages trên tất cả collection
+    /// </summary>
+    public async Task<ImageViewer.Application.DTOs.Maintenance.DeduplicationSummaryDto> DeduplicateAllCollectionsAsync()
+    {
+        _logger.LogInformation("🧹 Starting global deduplication for thumbnails and cache images...");
+
+        var collections = await _collectionRepository.GetAllAsync();
+        var processed = 0;
+        var totalThumbsRemoved = 0;
+        var totalCachesRemoved = 0;
+        var collectionsWithDuplicates = 0;
+        var totalThumbDuplicatesFound = 0;
+        var totalCacheDuplicatesFound = 0;
+        var scanned = 0;
+
+        foreach (var col in collections)
+        {
+            scanned++;
+            // Compute duplicate counts prior to dedupe for reporting
+            var thumbList = col.Thumbnails?.ToList() ?? new List<Domain.ValueObjects.ThumbnailEmbedded>();
+            var cacheList = col.CacheImages?.ToList() ?? new List<Domain.ValueObjects.CacheImageEmbedded>();
+            var thumbDistinct = thumbList
+                .GroupBy(t => new { t.ImageId, t.Width, t.Height })
+                .Select(g => g.First())
+                .ToList();
+            var cacheDistinct = cacheList
+                .GroupBy(c => new { c.ImageId, c.Width, c.Height })
+                .Select(g => g.First())
+                .ToList();
+            var thumbDupes = Math.Max(0, thumbList.Count - thumbDistinct.Count);
+            var cacheDupes = Math.Max(0, cacheList.Count - cacheDistinct.Count);
+
+            if (thumbDupes > 0 || cacheDupes > 0)
+            {
+                collectionsWithDuplicates++;
+                totalThumbDuplicatesFound += thumbDupes;
+                totalCacheDuplicatesFound += cacheDupes;
+                _logger.LogInformation("📌 Duplicates detected in collection {CollectionId} ({Name}): thumbs={ThumbDupes}, cache={CacheDupes}", col.Id, col.Name, thumbDupes, cacheDupes);
+            }
+
+            var (rt, rc) = await DeduplicateCollectionAsync(col.Id);
+            if (rt > 0 || rc > 0)
+            {
+                processed++;
+                totalThumbsRemoved += rt;
+                totalCachesRemoved += rc;
+                _logger.LogInformation("🧹 Collection {CollectionId}: removed {Thumbs} thumbnails, {Caches} cache entries", col.Id, rt, rc);
+            }
+            else if (scanned % 100 == 0)
+            {
+                // Periodic heartbeat log for long runs
+                _logger.LogInformation("⏱️ Deduplication progress: scanned {Scanned} collections, changes in {Processed}", scanned, processed);
+            }
+        }
+
+        _logger.LogInformation("✅ Global deduplication complete: scanned={Scanned}, withDuplicates={WithDupes}, changed={Processed}, removed thumbs={Thumbs}, cache={Caches}",
+            scanned, collectionsWithDuplicates, processed, totalThumbsRemoved, totalCachesRemoved);
+
+        return new ImageViewer.Application.DTOs.Maintenance.DeduplicationSummaryDto
+        {
+            CollectionsScanned = scanned,
+            CollectionsWithDuplicates = collectionsWithDuplicates,
+            CollectionsProcessed = processed,
+            TotalThumbDuplicatesFound = totalThumbDuplicatesFound,
+            TotalCacheDuplicatesFound = totalCacheDuplicatesFound,
+            TotalThumbsRemoved = totalThumbsRemoved,
+            TotalCachesRemoved = totalCachesRemoved
+        };
+    }
 }
 

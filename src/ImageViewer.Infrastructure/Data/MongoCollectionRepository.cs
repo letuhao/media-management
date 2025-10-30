@@ -259,56 +259,74 @@ public class MongoCollectionRepository : MongoRepository<Collection>, ICollectio
 
     public async Task<bool> AtomicAddThumbnailAsync(ObjectId collectionId, Domain.ValueObjects.ThumbnailEmbedded thumbnail)
     {
-        var filter = Builders<Collection>.Filter.Eq(x => x.Id, collectionId);
+        // Guard against duplicates using composite key (imageId + width + height)
+        var filter = Builders<Collection>.Filter.And(
+            Builders<Collection>.Filter.Eq(x => x.Id, collectionId),
+            Builders<Collection>.Filter.Not(
+                Builders<Collection>.Filter.ElemMatch(
+                    x => x.Thumbnails,
+                    Builders<Domain.ValueObjects.ThumbnailEmbedded>.Filter.And(
+                        Builders<Domain.ValueObjects.ThumbnailEmbedded>.Filter.Eq(t => t.ImageId, thumbnail.ImageId),
+                        Builders<Domain.ValueObjects.ThumbnailEmbedded>.Filter.Eq(t => t.Width, thumbnail.Width),
+                        Builders<Domain.ValueObjects.ThumbnailEmbedded>.Filter.Eq(t => t.Height, thumbnail.Height)
+                    )
+                )
+            )
+        );
+
         var update = Builders<Collection>.Update
             .Push(x => x.Thumbnails, thumbnail)
             .Set(x => x.UpdatedAt, DateTime.UtcNow);
-        
+
         var result = await _collection.UpdateOneAsync(filter, update);
         return result.ModifiedCount > 0;
     }
 
     public async Task<bool> AtomicAddThumbnailsAsync(ObjectId collectionId, IEnumerable<Domain.ValueObjects.ThumbnailEmbedded> thumbnails)
     {
-        var thumbnailList = thumbnails.ToList();
-        if (!thumbnailList.Any())
+        // Perform guarded per-item adds to ensure uniqueness under concurrency
+        var anyAdded = false;
+        foreach (var tn in thumbnails)
         {
-            return true; // Nothing to add
+            var added = await AtomicAddThumbnailAsync(collectionId, tn);
+            anyAdded = anyAdded || added;
         }
-
-        var filter = Builders<Collection>.Filter.Eq(x => x.Id, collectionId);
-        var update = Builders<Collection>.Update
-            .PushEach(x => x.Thumbnails, thumbnailList)
-            .Set(x => x.UpdatedAt, DateTime.UtcNow);
-        
-        var result = await _collection.UpdateOneAsync(filter, update);
-        return result.ModifiedCount > 0;
+        return true; // Operation succeeds even if some were already present
     }
 
     public async Task<bool> AtomicAddCacheImagesAsync(ObjectId collectionId, IEnumerable<Domain.ValueObjects.CacheImageEmbedded> cacheImages)
     {
-        var cacheImageList = cacheImages.ToList();
-        if (!cacheImageList.Any())
+        // Perform guarded per-item adds to ensure uniqueness under concurrency
+        var anyAdded = false;
+        foreach (var ci in cacheImages)
         {
-            return true; // Nothing to add
+            var added = await AtomicAddCacheImageAsync(collectionId, ci);
+            anyAdded = anyAdded || added;
         }
-
-        var filter = Builders<Collection>.Filter.Eq(x => x.Id, collectionId);
-        var update = Builders<Collection>.Update
-            .PushEach(x => x.CacheImages, cacheImageList)
-            .Set(x => x.UpdatedAt, DateTime.UtcNow);
-        
-        var result = await _collection.UpdateOneAsync(filter, update);
-        return result.ModifiedCount > 0;
+        return true; // Operation succeeds even if some were already present
     }
 
     public async Task<bool> AtomicAddCacheImageAsync(ObjectId collectionId, Domain.ValueObjects.CacheImageEmbedded cacheImage)
     {
-        var filter = Builders<Collection>.Filter.Eq(x => x.Id, collectionId);
+        // Guard against duplicates using composite key (imageId + width + height)
+        var filter = Builders<Collection>.Filter.And(
+            Builders<Collection>.Filter.Eq(x => x.Id, collectionId),
+            Builders<Collection>.Filter.Not(
+                Builders<Collection>.Filter.ElemMatch(
+                    x => x.CacheImages,
+                    Builders<Domain.ValueObjects.CacheImageEmbedded>.Filter.And(
+                        Builders<Domain.ValueObjects.CacheImageEmbedded>.Filter.Eq(c => c.ImageId, cacheImage.ImageId),
+                        Builders<Domain.ValueObjects.CacheImageEmbedded>.Filter.Eq(c => c.Width, cacheImage.Width),
+                        Builders<Domain.ValueObjects.CacheImageEmbedded>.Filter.Eq(c => c.Height, cacheImage.Height)
+                    )
+                )
+            )
+        );
+
         var update = Builders<Collection>.Update
             .Push(x => x.CacheImages, cacheImage)
             .Set(x => x.UpdatedAt, DateTime.UtcNow);
-        
+
         var result = await _collection.UpdateOneAsync(filter, update);
         return result.ModifiedCount > 0;
     }
@@ -342,7 +360,7 @@ public class MongoCollectionRepository : MongoRepository<Collection>, ICollectio
 
     /// <summary>
     /// Atomically adds a cache image only if it doesn't already exist (prevents duplicates)
-    /// Uses MongoDB query to check for existing records before adding
+    /// Uses MongoDB query with composite key (ImageId + Width + Height) to check for existing records before adding
     /// </summary>
     public async Task<bool> AtomicAddCacheImageIfNotExistsAsync(ObjectId collectionId, CacheImageEmbedded cacheImage)
     {
@@ -350,7 +368,11 @@ public class MongoCollectionRepository : MongoRepository<Collection>, ICollectio
             Builders<Collection>.Filter.Eq(x => x.Id, collectionId),
             Builders<Collection>.Filter.Not(
                 Builders<Collection>.Filter.ElemMatch(x => x.CacheImages, 
-                    Builders<CacheImageEmbedded>.Filter.Eq(c => c.ImageId, cacheImage.ImageId)
+                    Builders<CacheImageEmbedded>.Filter.And(
+                        Builders<CacheImageEmbedded>.Filter.Eq(c => c.ImageId, cacheImage.ImageId),
+                        Builders<CacheImageEmbedded>.Filter.Eq(c => c.Width, cacheImage.Width),
+                        Builders<CacheImageEmbedded>.Filter.Eq(c => c.Height, cacheImage.Height)
+                    )
                 )
             )
         );

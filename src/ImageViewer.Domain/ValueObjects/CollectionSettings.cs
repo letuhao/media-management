@@ -5,6 +5,7 @@ namespace ImageViewer.Domain.ValueObjects;
 /// <summary>
 /// Collection settings value object
 /// </summary>
+[BsonIgnoreExtraElements] // Ignore unknown fields from historical documents (e.g., useDirectFileAccess)
 public class CollectionSettings
 {
     [BsonElement("enabled")]
