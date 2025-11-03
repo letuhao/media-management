@@ -566,9 +566,13 @@ const ImageViewer: React.FC = () => {
           navigate(`/collections/${collectionId}`);
           break;
         case 'ArrowLeft':
+          // Skip if Ctrl is pressed (handled by useHotkeys for collection navigation)
+          if (e.ctrlKey) break;
           navigateToImage('prev');
           break;
         case 'ArrowRight':
+          // Skip if Ctrl is pressed (handled by useHotkeys for collection navigation)
+          if (e.ctrlKey) break;
           navigateToImage('next');
           break;
         case '+':
