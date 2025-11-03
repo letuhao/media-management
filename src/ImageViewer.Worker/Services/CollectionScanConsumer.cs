@@ -10,6 +10,7 @@ using ImageViewer.Infrastructure.Data;
 using ImageViewer.Application.Helpers;
 using MongoDB.Bson;
 using ImageViewer.Domain.ValueObjects;
+using FFMpegCore;
 
 namespace ImageViewer.Worker.Services;
 
@@ -417,7 +418,7 @@ public class CollectionScanConsumer : BaseMessageConsumer
     private static bool IsMediaFile(string fileName)
     {
         var extension = Path.GetExtension(fileName).ToLowerInvariant();
-        var supportedExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".svg" };
+        var supportedExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".svg", ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg" };
         return supportedExtensions.Contains(extension);
     }
 
@@ -425,6 +426,28 @@ public class CollectionScanConsumer : BaseMessageConsumer
     {
         try
         {
+            // Check if this is a video file
+            var extension = Path.GetExtension(archiveEntry.EntryName).ToLowerInvariant();
+            var isVideo = IsVideoFile(extension);
+            
+            if (isVideo)
+            {
+                // Handle video files using FFProbe
+                var filePath = archiveEntry.GetPhysicalFileFullPath();
+                if (File.Exists(filePath))
+                {
+                    var videoInfo = GetVideoInfo(filePath);
+                    if (videoInfo.Width > 0 && videoInfo.Height > 0)
+                    {
+                        _logger.LogDebug("🎬 Extracted video dimensions for {Path}: {Width}x{Height}", 
+                            filePath, videoInfo.Width, videoInfo.Height);
+                        return (videoInfo.Width, videoInfo.Height);
+                    }
+                }
+                return (0, 0); // Failed to extract video dimensions
+            }
+            
+            // Handle image files using image processing service
             using var scope = _serviceScopeFactory.CreateScope();
             var imageProcessingService = scope.ServiceProvider.GetRequiredService<IImageProcessingService>();
             
@@ -443,6 +466,46 @@ public class CollectionScanConsumer : BaseMessageConsumer
         {
             _logger.LogWarning(ex, "⚠️ Failed to extract dimensions for {Path}#{Entry}", 
                 archiveEntry.ArchivePath, archiveEntry.EntryName);
+            return (0, 0);
+        }
+    }
+    
+    private static bool IsVideoFile(string extension)
+    {
+        var videoExtensions = new[] { ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg" };
+        return videoExtensions.Contains(extension);
+    }
+    
+    private static (int Width, int Height) GetVideoInfo(string filePath)
+    {
+        try
+        {
+            if (!File.Exists(filePath))
+                return (0, 0);
+
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+            
+            // Check if it's a supported video format
+            var supportedExtensions = new[] { ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg" };
+            if (!supportedExtensions.Contains(extension))
+                return (0, 0);
+
+            // Use FFMpegCore to get actual video information
+            var mediaInfo = FFProbe.Analyse(filePath);
+            var videoStream = mediaInfo.VideoStreams.FirstOrDefault();
+            
+            if (videoStream != null)
+            {
+                var width = videoStream.Width;
+                var height = videoStream.Height;
+                return (width, height);
+            }
+            
+            return (0, 0);
+        }
+        catch (Exception)
+        {
+            // Silently fail - return 0,0 for unsupported videos or errors
             return (0, 0);
         }
     }
