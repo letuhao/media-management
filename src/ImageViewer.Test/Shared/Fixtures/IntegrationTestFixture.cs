@@ -5,6 +5,7 @@ using ImageViewer.Domain.Interfaces;
 using ImageViewer.Infrastructure.Services;
 using ImageViewer.Domain.Entities;
 using MongoDB.Bson;
+using ImageViewer.Application.Options;
 
 namespace ImageViewer.Test.Shared.Fixtures;
 
@@ -49,6 +50,9 @@ namespace ImageViewer.Test.Shared.Fixtures;
                services.AddSingleton(CreateMockUserSettingRepository().Object);
                services.AddSingleton(CreateMockNotificationQueueRepository().Object);
                services.AddSingleton(CreateMockUnitOfWork().Object);
+
+        // Configure options required by services
+        services.Configure<FFmpegOptions>(_ => { });
 
         // Add application services
         services.AddScoped<ISystemHealthService, SystemHealthService>();

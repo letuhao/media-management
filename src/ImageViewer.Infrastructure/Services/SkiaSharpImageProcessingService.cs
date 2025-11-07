@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using SkiaSharp;
 using ImageViewer.Domain.Interfaces;
 using ImageViewer.Domain.ValueObjects;
@@ -6,6 +7,11 @@ using ImageViewer.Domain.Enums;
 using SharpCompress.Archives;
 using ImageViewer.Application.Helpers;
 using FFMpegCore;
+using ImageViewer.Application.Options;
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace ImageViewer.Infrastructure.Services;
 
@@ -15,10 +21,12 @@ namespace ImageViewer.Infrastructure.Services;
 public class SkiaSharpImageProcessingService : IImageProcessingService
 {
     private readonly ILogger<SkiaSharpImageProcessingService> _logger;
+    private readonly string? _ffmpegBinPath;
 
-    public SkiaSharpImageProcessingService(ILogger<SkiaSharpImageProcessingService> logger)
+    public SkiaSharpImageProcessingService(ILogger<SkiaSharpImageProcessingService> logger, IOptions<FFmpegOptions> ffmpegOptions)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _ffmpegBinPath = ffmpegOptions?.Value?.BinPath;
     }
 
     public Task<ImageMetadata> ExtractMetadataAsync(ArchiveEntryInfo archiveEntry, CancellationToken cancellationToken = default)
@@ -161,7 +169,7 @@ public class SkiaSharpImageProcessingService : IImageProcessingService
     /// <summary>
     /// Generate thumbnail from video file by extracting a frame
     /// </summary>
-    private Task<byte[]> GenerateVideoThumbnailAsync(string videoPath, int width, int height, string format, int quality, CancellationToken cancellationToken)
+    private async Task<byte[]> GenerateVideoThumbnailAsync(string videoPath, int width, int height, string format, int quality, CancellationToken cancellationToken)
     {
         try
         {
@@ -186,15 +194,17 @@ public class SkiaSharpImageProcessingService : IImageProcessingService
                     ? Math.Min(1.0, Math.Max(0.1, duration.TotalSeconds * 0.1))
                     : 0.5;
                 
-                _logger.LogDebug("Extracting frame from {VideoPath} at {SeekTime} seconds", videoPath, seekTime);
+                _logger.LogDebug("Extracting frame from {VideoPath} at {SeekTime} seconds to {TempPath}", videoPath, seekTime, tempFramePath);
 
-                // Use FFMpeg to extract frame as JPEG (size is null to use original size, captureTime specifies when to capture)
-                FFMpeg.Snapshot(videoPath, tempFramePath, size: null, captureTime: TimeSpan.FromSeconds(seekTime));
-                
+                await ExtractVideoFrameAsync(videoPath, tempFramePath, seekTime, cancellationToken);
+
                 if (!File.Exists(tempFramePath))
                 {
-                    throw new FileNotFoundException($"Failed to extract frame from video: {videoPath}");
+                    _logger.LogError("❌ Frame file not created after FFmpeg execution. Video: {VideoPath}, TempPath: {TempPath}", videoPath, tempFramePath);
+                    throw new FileNotFoundException($"Failed to extract frame from video: {videoPath}. Temp file not created: {tempFramePath}");
                 }
+                
+                _logger.LogDebug("✅ Frame extracted successfully: {TempPath} ({Size} bytes)", tempFramePath, new FileInfo(tempFramePath).Length);
 
                 // Load the extracted frame and resize it using SkiaSharp
                 using var frameStream = File.OpenRead(tempFramePath);
@@ -230,7 +240,20 @@ public class SkiaSharpImageProcessingService : IImageProcessingService
                 var result = thumbnailStream.ToArray();
                 
                 _logger.LogDebug("✅ Successfully generated video thumbnail: {Size} bytes, format {Format}", result.Length, format);
-                return Task.FromResult(result);
+                return result;
+            }
+            catch (System.ComponentModel.Win32Exception winEx) when (winEx.NativeErrorCode == 2 || winEx.Message.Contains("ffprobe", StringComparison.OrdinalIgnoreCase))
+            {
+                // FFprobe not found in PATH
+                _logger.LogWarning("⚠️ FFprobe not found in system PATH. Video thumbnail generation requires FFmpeg to be installed. Error: {ErrorMessage}", winEx.Message);
+                throw new InvalidOperationException("FFprobe not found. Please install FFmpeg and ensure ffprobe.exe is in your system PATH, or configure FFMpegCore with the path to FFmpeg binaries.", winEx);
+            }
+            catch (Exception ex) when (ex.GetType().FullName?.Contains("InstanceFileNotFoundException") == true || 
+                                        ex.Message.Contains("ffprobe", StringComparison.OrdinalIgnoreCase))
+            {
+                // FFMpegCore-specific exception for missing FFprobe
+                _logger.LogWarning("⚠️ FFprobe not found. Video thumbnail generation requires FFmpeg to be installed. Error: {ErrorMessage}", ex.Message);
+                throw new InvalidOperationException("FFprobe not found. Please install FFmpeg and ensure ffprobe.exe is in your system PATH, or configure FFMpegCore with the path to FFmpeg binaries.", ex);
             }
             finally
             {
@@ -248,10 +271,135 @@ public class SkiaSharpImageProcessingService : IImageProcessingService
                 }
             }
         }
+        catch (InvalidOperationException)
+        {
+            // Re-throw InvalidOperationException (including our wrapped FFprobe errors) as-is
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ Error generating video thumbnail for {VideoPath}", videoPath);
             throw;
+        }
+    }
+
+    private string ResolveFfmpegExecutablePath()
+    {
+        var executableName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "ffmpeg.exe" : "ffmpeg";
+
+        if (!string.IsNullOrWhiteSpace(_ffmpegBinPath))
+        {
+            var configuredPath = Path.Combine(_ffmpegBinPath, executableName);
+            if (File.Exists(configuredPath))
+            {
+                return configuredPath;
+            }
+
+            _logger.LogWarning("Configured FFmpeg binary not found at {ConfiguredPath}. Falling back to defaults.", configuredPath);
+        }
+
+        var globalFolder = GlobalFFOptions.Current?.BinaryFolder;
+        if (!string.IsNullOrWhiteSpace(globalFolder))
+        {
+            var globalPath = Path.Combine(globalFolder, executableName);
+            if (File.Exists(globalPath))
+            {
+                return globalPath;
+            }
+        }
+
+        return executableName;
+    }
+
+    private async Task ExtractVideoFrameAsync(string videoPath, string outputPath, double seekTimeSeconds, CancellationToken cancellationToken)
+    {
+        var ffmpegExecutable = ResolveFfmpegExecutablePath();
+        _logger.LogDebug("Using FFmpeg executable: {FfmpegPath}", ffmpegExecutable);
+        var directory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = ffmpegExecutable,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        startInfo.ArgumentList.Add("-hide_banner");
+        startInfo.ArgumentList.Add("-loglevel");
+        startInfo.ArgumentList.Add("error");
+        startInfo.ArgumentList.Add("-y");
+        startInfo.ArgumentList.Add("-ss");
+        startInfo.ArgumentList.Add(seekTimeSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+        startInfo.ArgumentList.Add("-i");
+        startInfo.ArgumentList.Add(videoPath);
+        startInfo.ArgumentList.Add("-frames:v");
+        startInfo.ArgumentList.Add("1");
+        startInfo.ArgumentList.Add("-update");
+        startInfo.ArgumentList.Add("1");
+        startInfo.ArgumentList.Add(outputPath);
+
+        using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        var errorBuilder = new StringBuilder();
+
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (!string.IsNullOrEmpty(e.Data))
+            {
+                errorBuilder.AppendLine(e.Data);
+            }
+        };
+        process.OutputDataReceived += (_, __) => { };
+
+        try
+        {
+            if (!process.Start())
+            {
+                throw new InvalidOperationException($"Failed to start FFmpeg process using executable '{ffmpegExecutable}'.");
+            }
+
+            process.BeginErrorReadLine();
+            process.BeginOutputReadLine();
+
+            using var registration = cancellationToken.Register(() =>
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                }
+                catch (Exception killEx)
+                {
+                    _logger.LogWarning(killEx, "Failed to kill FFmpeg process after cancellation.");
+                }
+            });
+
+            await process.WaitForExitAsync(cancellationToken);
+
+            if (process.ExitCode != 0)
+            {
+                var errorOutput = errorBuilder.ToString().Trim();
+                throw new InvalidOperationException($"FFmpeg exited with code {process.ExitCode}. {(string.IsNullOrEmpty(errorOutput) ? "" : errorOutput)}");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not InvalidOperationException)
+        {
+            var errorOutput = errorBuilder.ToString().Trim();
+            var message = string.IsNullOrEmpty(errorOutput)
+                ? ex.Message
+                : $"{ex.Message} | FFmpeg error: {errorOutput}";
+            throw new InvalidOperationException(message, ex);
         }
     }
 

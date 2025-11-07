@@ -259,26 +259,12 @@ public class CollectionScanConsumer : BaseMessageConsumer
                     
                     _logger.LogInformation("✅ Scan stage completed for job {JobId}: {Count} files found", scanMessage.JobId, mediaFiles.Count);
                     
+                    // Note: For direct mode, job stage tracking is handled inside ProcessDirectFileAccessMode
+                    // to ensure accurate counts (especially when video thumbnails fail to generate)
+                    // This avoids double-updating the job stages
                     if (useDirectAccess)
                     {
-                        // Direct mode: Mark thumbnail/cache stages as completed immediately
-                        await backgroundJobService.UpdateJobStageAsync(
-                            ObjectId.Parse(scanMessage.JobId), 
-                            "thumbnail", 
-                            "Completed", 
-                            mediaFiles.Count, 
-                            mediaFiles.Count, 
-                            $"Using direct file access (no generation needed)");
-                        
-                        await backgroundJobService.UpdateJobStageAsync(
-                            ObjectId.Parse(scanMessage.JobId), 
-                            "cache", 
-                            "Completed", 
-                            mediaFiles.Count, 
-                            mediaFiles.Count, 
-                            $"Using direct file access (no generation needed)");
-                        
-                        _logger.LogInformation("✅ Direct mode: All stages completed for job {JobId}", scanMessage.JobId);
+                        _logger.LogDebug("📝 Job stage tracking for direct mode handled inside ProcessDirectFileAccessMode");
                     }
                     else
                     {
@@ -527,8 +513,9 @@ public class CollectionScanConsumer : BaseMessageConsumer
 
     /// <summary>
     /// Process collection in direct file access mode (directory collections only)
-    /// Creates image/thumbnail/cache entries that reference original files directly
-    /// Skips cache/thumbnail generation entirely for massive speed and disk space savings
+    /// For images: Creates entries that reference original files directly
+    /// For videos: Generates actual thumbnail images (videos can't be displayed as thumbnails)
+    /// Skips cache generation for images but generates thumbnails for videos
     /// </summary>
     private async Task ProcessDirectFileAccessMode(
         Domain.Entities.Collection collection,
@@ -543,9 +530,34 @@ public class CollectionScanConsumer : BaseMessageConsumer
                 mediaFiles.Count, collection.Name);
             
             var collectionRepository = scope.ServiceProvider.GetRequiredService<ICollectionRepository>();
+            var imageProcessingService = scope.ServiceProvider.GetRequiredService<IImageProcessingService>();
+            var imageProcessingSettingsService = scope.ServiceProvider.GetRequiredService<IImageProcessingSettingsService>();
+            var cacheService = scope.ServiceProvider.GetRequiredService<ICacheService>();
+            
             var imagesToAdd = new List<ImageEmbedded>();
             var thumbnailsToAdd = new List<ThumbnailEmbedded>();
             var cacheImagesToAdd = new List<CacheImageEmbedded>();
+            
+            // Get thumbnail settings
+            var thumbnailFormat = await imageProcessingSettingsService.GetThumbnailFormatAsync();
+            var thumbnailQuality = await imageProcessingSettingsService.GetThumbnailQualityAsync();
+            var thumbnailSize = await imageProcessingSettingsService.GetThumbnailSizeAsync();
+            var thumbnailWidth = thumbnailSize;
+            var thumbnailHeight = thumbnailSize; // Use same size for width and height
+            
+            // Get cache folders for thumbnail storage
+            var cacheFolders = await cacheService.GetCacheFoldersAsync();
+            var cacheFoldersList = cacheFolders.ToList();
+            if (cacheFoldersList.Count == 0)
+            {
+                throw new InvalidOperationException("No cache folders available for thumbnail storage");
+            }
+            
+            // Select cache folder consistently for this collection
+            var selectedIndex = Math.Abs(collection.Id.GetHashCode()) % cacheFoldersList.Count;
+            var selectedCacheFolder = cacheFoldersList[selectedIndex];
+            var thumbnailCollectionDir = Path.Combine(selectedCacheFolder.Path, "thumbnails", collection.Id.ToString());
+            Directory.CreateDirectory(thumbnailCollectionDir);
             
             foreach (var mediaFile in mediaFiles)
             {
@@ -576,17 +588,86 @@ public class CollectionScanConsumer : BaseMessageConsumer
                     // Get the generated image ID after adding to list
                     var imageId = image.Id;
                     var fullPath = Path.Combine(collection.Path, mediaFile.FileName);
+                    var isVideo = IsVideoFile(mediaFile.Extension);
                     
-                    // Create direct reference thumbnail (points to original file)
-                    var thumbnail = ThumbnailEmbedded.CreateDirectReference(
-                        imageId: imageId,
-                        originalFilePath: fullPath,
-                        width: width > 0 ? width : 1920, // Use actual width or default
-                        height: height > 0 ? height : 1080,
-                        fileSize: mediaFile.FileSize,
-                        format: mediaFile.Extension.TrimStart('.').ToLowerInvariant());
-                    
-                    thumbnailsToAdd.Add(thumbnail);
+                    // For videos: Generate actual thumbnail image (videos can't be displayed as thumbnails)
+                    // For images: Create direct reference thumbnail (points to original file)
+                    if (isVideo)
+                    {
+                        _logger.LogDebug("🎬 Generating thumbnail image for video: {FileName}", mediaFile.FileName);
+                        
+                        try
+                        {
+                            // Generate thumbnail using image processing service
+                            var thumbnailData = await imageProcessingService.GenerateThumbnailAsync(
+                                archiveEntry,
+                                thumbnailWidth,
+                                thumbnailHeight,
+                                thumbnailFormat,
+                                thumbnailQuality);
+                            
+                            if (thumbnailData == null || thumbnailData.Length == 0)
+                            {
+                                throw new InvalidOperationException("Failed to generate thumbnail data for video");
+                            }
+                            
+                            // Determine thumbnail file path
+                            var extension = thumbnailFormat.ToLowerInvariant() switch
+                            {
+                                "jpeg" => ".jpg",
+                                "jpg" => ".jpg",
+                                "png" => ".png",
+                                "webp" => ".webp",
+                                _ => ".jpg"
+                            };
+                            
+                            var fileNameWithoutExt = Path.GetFileNameWithoutExtension(mediaFile.FileName);
+                            var thumbnailFileName = $"{fileNameWithoutExt}_{thumbnailWidth}x{thumbnailHeight}{extension}";
+                            var thumbnailPath = Path.Combine(thumbnailCollectionDir, thumbnailFileName);
+                            
+                            // Save thumbnail to disk
+                            await File.WriteAllBytesAsync(thumbnailPath, thumbnailData);
+                            
+                            // Create thumbnail entry with actual file path
+                            var thumbnail = new ThumbnailEmbedded(
+                                imageId: imageId,
+                                thumbnailPath: thumbnailPath,
+                                width: thumbnailWidth,
+                                height: thumbnailHeight,
+                                fileSize: thumbnailData.Length,
+                                format: thumbnailFormat.ToUpperInvariant(),
+                                quality: thumbnailQuality);
+                            
+                            thumbnailsToAdd.Add(thumbnail);
+                            
+                            _logger.LogDebug("✅ Generated thumbnail image for video {FileName} → {ThumbnailPath}", 
+                                mediaFile.FileName, thumbnailPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            // For videos: If thumbnail generation fails, don't create any thumbnail entry
+                            // This allows the collection to be rescanned later to generate thumbnails
+                            // (e.g., after FFmpeg is installed)
+                            _logger.LogWarning(ex, "⚠️ Failed to generate thumbnail for video {FileName}. Skipping thumbnail entry. Collection can be rescanned later to generate thumbnails.", 
+                                mediaFile.FileName);
+                            
+                            // Don't add any thumbnail entry - image will be created but without thumbnail
+                            // User can rescan the collection later to generate thumbnails
+                        }
+                    }
+                    else
+                    {
+                        // For images: Create direct reference thumbnail (points to original file)
+                        var thumbnail = ThumbnailEmbedded.CreateDirectReference(
+                            imageId: imageId,
+                            originalFilePath: fullPath,
+                            width: width > 0 ? width : 1920, // Use actual width or default
+                            height: height > 0 ? height : 1080,
+                            fileSize: mediaFile.FileSize,
+                            format: mediaFile.Extension.TrimStart('.').ToLowerInvariant());
+                        
+                        thumbnailsToAdd.Add(thumbnail);
+                    }
                     
                     // Create direct reference cache (points to original file)
                     var cacheImage = CacheImageEmbedded.CreateDirectReference(
@@ -599,12 +680,12 @@ public class CollectionScanConsumer : BaseMessageConsumer
                     
                     cacheImagesToAdd.Add(cacheImage);
                     
-                    _logger.LogDebug("✅ Created direct references for {FileName} → {ImageId}", 
+                    _logger.LogDebug("✅ Created references for {FileName} → {ImageId}", 
                         mediaFile.FileName, imageId);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to create direct references for {FileName}, skipping", 
+                    _logger.LogWarning(ex, "Failed to create references for {FileName}, skipping", 
                         mediaFile.FileName);
                 }
             }
@@ -627,6 +708,49 @@ public class CollectionScanConsumer : BaseMessageConsumer
                 imagesToAdd.Count, thumbnailsToAdd.Count, cacheImagesToAdd.Count, collection.Name);
             _logger.LogInformation("💾 Disk space saved: ~{SavedGB:F2} GB (no cache/thumbnail copies generated)", 
                 (imagesToAdd.Sum(i => i.FileSize) * 0.4) / 1024.0 / 1024.0 / 1024.0);
+            
+            // Update job stage tracking with actual counts (important for videos with failed thumbnails)
+            if (!string.IsNullOrEmpty(jobId))
+            {
+                try
+                {
+                    var actualImageCount = imagesToAdd.Count;
+                    var actualThumbnailCount = thumbnailsToAdd.Count;
+                    var actualCacheCount = cacheImagesToAdd.Count;
+                    
+                    // Note: For videos with failed thumbnails, thumbnailCount may be less than imageCount
+                    var thumbnailMessage = actualThumbnailCount < actualImageCount
+                        ? $"Direct mode: {actualThumbnailCount} thumbnails created, {actualImageCount - actualThumbnailCount} skipped (video thumbnails can be generated on rescan)"
+                        : "Direct mode: All thumbnails created successfully";
+                    
+                    await backgroundJobService.UpdateJobStageAsync(
+                        ObjectId.Parse(jobId), 
+                        "thumbnail", 
+                        "Completed", 
+                        actualThumbnailCount, 
+                        actualImageCount,  // Total expected (some videos may have failed thumbnails)
+                        thumbnailMessage);
+                    
+                    await backgroundJobService.UpdateJobStageAsync(
+                        ObjectId.Parse(jobId), 
+                        "cache", 
+                        "Completed", 
+                        actualCacheCount, 
+                        actualImageCount, 
+                        "Direct mode: All cache references created");
+                    
+                    if (actualThumbnailCount < actualImageCount)
+                    {
+                        _logger.LogWarning("⚠️ Some thumbnails were skipped ({SkippedCount} of {TotalCount} videos failed thumbnail generation). Collection can be rescanned later to generate missing thumbnails.", 
+                            actualImageCount - actualThumbnailCount, actualImageCount);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to update job stages for {JobId}", jobId);
+                    // Don't throw - processing completed successfully
+                }
+            }
         }
         catch (Exception ex)
         {

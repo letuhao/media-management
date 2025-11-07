@@ -5,8 +5,10 @@ using ImageViewer.Worker.Services;
 using ImageViewer.Infrastructure.Data;
 using ImageViewer.Infrastructure.Extensions;
 using ImageViewer.Application.Services;
+using ImageViewer.Application.Options;
 using ImageViewer.Infrastructure.Services;
 using ImageViewer.Domain.Interfaces;
+using FFMpegCore;
 
 Console.WriteLine("Start worker ...");
 
@@ -21,6 +23,51 @@ Log.Logger = new LoggerConfiguration()
 // Use Serilog for all logging
 builder.Services.AddSerilog();
 
+// Configure FFmpeg BEFORE any services are created (must be done before FFMpegCore usage)
+var ffmpegConfig = builder.Configuration.GetSection("FFmpeg").Get<FFmpegOptions>();
+if (ffmpegConfig != null && !string.IsNullOrWhiteSpace(ffmpegConfig.BinPath))
+{
+    var binPath = ffmpegConfig.BinPath;
+    if (Directory.Exists(binPath))
+    {
+        // Verify ffmpeg.exe and ffprobe.exe exist
+        var ffmpegExe = Path.Combine(binPath, "ffmpeg.exe");
+        var ffprobeExe = Path.Combine(binPath, "ffprobe.exe");
+        
+        if (File.Exists(ffmpegExe) && File.Exists(ffprobeExe))
+        {
+            GlobalFFOptions.Configure(new FFOptions { BinaryFolder = binPath });
+            Console.WriteLine($"✅ FFmpeg configured: {binPath}");
+            Log.Logger.Information("✅ FFmpeg configured: {BinPath}", binPath);
+        }
+        else
+        {
+            Console.WriteLine($"⚠️ FFmpeg binaries not found in {binPath}");
+            Log.Logger.Warning("⚠️ FFmpeg binaries not found in {BinPath}. Looking for ffmpeg.exe and ffprobe.exe", binPath);
+            if (!File.Exists(ffmpegExe))
+            {
+                Console.WriteLine($"  Missing: {ffmpegExe}");
+                Log.Logger.Warning("  Missing: {FFmpegExe}", ffmpegExe);
+            }
+            if (!File.Exists(ffprobeExe))
+            {
+                Console.WriteLine($"  Missing: {ffprobeExe}");
+                Log.Logger.Warning("  Missing: {FFprobeExe}", ffprobeExe);
+            }
+        }
+    }
+    else
+    {
+        Console.WriteLine($"⚠️ FFmpeg bin path does not exist: {binPath}");
+        Log.Logger.Warning("⚠️ FFmpeg bin path does not exist: {BinPath}", binPath);
+    }
+}
+else
+{
+    Console.WriteLine("ℹ️ FFmpeg bin path not configured. FFMpegCore will search system PATH.");
+    Log.Logger.Information("ℹ️ FFmpeg bin path not configured. FFMpegCore will search system PATH.");
+}
+
 // Configure MongoDB
 builder.Services.AddMongoDb(builder.Configuration);
 
@@ -32,6 +79,9 @@ builder.Services.Configure<BatchProcessingOptions>(builder.Configuration.GetSect
 
 // Configure Memory Optimization
 builder.Services.Configure<MemoryOptimizationOptions>(builder.Configuration.GetSection("MemoryOptimization"));
+
+// Configure FFmpeg options (for dependency injection if needed)
+builder.Services.Configure<FFmpegOptions>(builder.Configuration.GetSection("FFmpeg"));
 
 // Register RabbitMQ ConnectionFactory
 builder.Services.AddSingleton<IConnectionFactory>(provider =>

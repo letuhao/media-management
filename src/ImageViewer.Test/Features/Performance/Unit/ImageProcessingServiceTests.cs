@@ -2,7 +2,9 @@ using ImageViewer.Infrastructure.Services;
 using ImageViewer.Domain.ValueObjects;
 using ImageViewer.Domain.Enums;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using SkiaSharp;
+using ImageViewer.Application.Options;
 
 namespace ImageViewer.Test.Features.Performance.Unit;
 
@@ -13,11 +15,13 @@ public class ImageProcessingServiceTests
 {
     private readonly Mock<ILogger<SkiaSharpImageProcessingService>> _mockLogger;
     private readonly SkiaSharpImageProcessingService _imageProcessingService;
+    private readonly IOptions<FFmpegOptions> _ffmpegOptions;
 
     public ImageProcessingServiceTests()
     {
         _mockLogger = new Mock<ILogger<SkiaSharpImageProcessingService>>();
-        _imageProcessingService = new SkiaSharpImageProcessingService(_mockLogger.Object);
+        _ffmpegOptions = Options.Create(new FFmpegOptions());
+        _imageProcessingService = new SkiaSharpImageProcessingService(_mockLogger.Object, _ffmpegOptions);
     }
 
     /// <summary>
@@ -39,7 +43,7 @@ public class ImageProcessingServiceTests
     public void Constructor_WithValidLogger_ShouldCreateInstance()
     {
         // Arrange & Act
-        var service = new SkiaSharpImageProcessingService(_mockLogger.Object);
+        var service = new SkiaSharpImageProcessingService(_mockLogger.Object, _ffmpegOptions);
 
         // Assert
         service.Should().NotBeNull();
@@ -49,7 +53,7 @@ public class ImageProcessingServiceTests
     public void Constructor_WithNullLogger_ShouldThrowArgumentNullException()
     {
         // Arrange, Act & Assert
-        var action = () => new SkiaSharpImageProcessingService(null!);
+        var action = () => new SkiaSharpImageProcessingService(null!, _ffmpegOptions);
         action.Should().Throw<ArgumentNullException>()
             .WithParameterName("logger");
     }

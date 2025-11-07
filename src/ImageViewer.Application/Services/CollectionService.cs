@@ -1279,17 +1279,57 @@ public class CollectionService : ICollectionService
     {
         try
         {
-            // Create archived collection
-            var archivedCollection = new CollectionArchive(collection, archiveReason, archivedBy);
-            await _collectionArchiveRepository.CreateAsync(archivedCollection);
+            // Check if archive already exists
+            var existingArchive = await _collectionArchiveRepository.GetByOriginalIdAsync(collection.Id);
             
-            // Clean up cache and index
+            if (existingArchive != null)
+            {
+                _logger.LogWarning("Collection {CollectionId} is already archived (ArchiveId: {ArchiveId}, ArchivedAt: {ArchivedAt}). Skipping archive creation, but proceeding with cleanup and deletion.", 
+                    collection.Id, existingArchive.Id, existingArchive.ArchivedAt);
+            }
+            else
+            {
+                // Create archived collection
+                try
+                {
+                    var archivedCollection = new CollectionArchive(collection, archiveReason, archivedBy);
+                    await _collectionArchiveRepository.CreateAsync(archivedCollection);
+                    _logger.LogInformation("Created archive record for collection {CollectionId} with reason: {ArchiveReason}", 
+                        collection.Id, archiveReason);
+                }
+                catch (MongoWriteException ex) when (ex.WriteError?.Code == 11000)
+                {
+                    // Handle duplicate key error gracefully (race condition case)
+                    _logger.LogWarning("Duplicate key error when creating archive for collection {CollectionId}. Archive may have been created concurrently. Proceeding with cleanup and deletion.", 
+                        collection.Id);
+                    
+                    // Verify the archive was created
+                    existingArchive = await _collectionArchiveRepository.GetByOriginalIdAsync(collection.Id);
+                    if (existingArchive == null)
+                    {
+                        _logger.LogError("Archive creation failed with duplicate key error, but archive was not found. This is unexpected.");
+                        throw; // Re-throw if archive still doesn't exist
+                    }
+                }
+            }
+            
+            // Clean up cache and index (safe to call multiple times)
             await CleanupCollectionResourcesAsync(collection);
             
-            // Delete the original collection
-            await _collectionRepository.DeleteAsync(collection.Id);
+            // Check if collection still exists before deleting (it might have been deleted already)
+            var collectionStillExists = await _collectionRepository.GetByIdAsync(collection.Id);
+            if (collectionStillExists != null)
+            {
+                // Delete the original collection
+                await _collectionRepository.DeleteAsync(collection.Id);
+                _logger.LogInformation("Deleted original collection {CollectionId} after archiving", collection.Id);
+            }
+            else
+            {
+                _logger.LogDebug("Collection {CollectionId} no longer exists, skipping deletion", collection.Id);
+            }
             
-            _logger.LogInformation("Successfully archived collection {CollectionId} with reason: {ArchiveReason}", 
+            _logger.LogInformation("Successfully processed archive for collection {CollectionId} with reason: {ArchiveReason}", 
                 collection.Id, archiveReason);
         }
         catch (Exception ex)
@@ -1303,18 +1343,38 @@ public class CollectionService : ICollectionService
     {
         try
         {
-            // Clean up cache
+            // Clean up cache (may fail if collection doesn't exist, which is fine)
             if (_cacheService != null)
             {
-                await _cacheService.ClearCollectionCacheAsync(collection.Id);
-                _logger.LogDebug("Cleared cache for collection {CollectionId}", collection.Id);
+                try
+                {
+                    await _cacheService.ClearCollectionCacheAsync(collection.Id);
+                    _logger.LogDebug("Cleared cache for collection {CollectionId}", collection.Id);
+                }
+                catch (KeyNotFoundException)
+                {
+                    _logger.LogDebug("Collection {CollectionId} not found when clearing cache (may have been deleted already)", collection.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error clearing cache for collection {CollectionId}", collection.Id);
+                    // Continue with other cleanup operations
+                }
             }
             
-            // Remove from Redis index
+            // Remove from Redis index (safe to call multiple times)
             if (_collectionIndexService != null)
             {
-                await _collectionIndexService.RemoveCollectionAsync(collection.Id);
-                _logger.LogDebug("Removed collection {CollectionId} from Redis index", collection.Id);
+                try
+                {
+                    await _collectionIndexService.RemoveCollectionAsync(collection.Id);
+                    _logger.LogDebug("Removed collection {CollectionId} from Redis index", collection.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error removing collection {CollectionId} from Redis index", collection.Id);
+                    // Continue even if index removal fails
+                }
             }
             
             _logger.LogDebug("Cleaned up resources for archived collection {CollectionId}", collection.Id);

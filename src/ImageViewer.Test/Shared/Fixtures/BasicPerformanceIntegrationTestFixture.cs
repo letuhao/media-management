@@ -6,6 +6,7 @@ using ImageViewer.Infrastructure.Services;
 using ImageViewer.Test.Shared.TestData;
 using MongoDB.Bson;
 using ImageViewer.Domain.Entities;
+using ImageViewer.Application.Options;
 
 namespace ImageViewer.Test.Shared.Fixtures;
 
@@ -50,6 +51,8 @@ public class BasicPerformanceIntegrationTestFixture : IAsyncLifetime
         services.AddSingleton(Mock.Of<IMessageQueueService>());
 
         // Add application services
+        services.Configure<FFmpegOptions>(_ => { });
+
         services.AddScoped<ISystemHealthService, SystemHealthService>();
         services.AddScoped<IBulkOperationService, BulkOperationService>();
         services.AddScoped<IBackgroundJobService, Application.Services.BackgroundJobService>();
