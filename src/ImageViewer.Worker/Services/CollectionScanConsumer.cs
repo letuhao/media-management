@@ -642,6 +642,13 @@ public class CollectionScanConsumer : BaseMessageConsumer
                             
                             _logger.LogDebug("✅ Generated thumbnail image for video {FileName} → {ThumbnailPath}", 
                                 mediaFile.FileName, thumbnailPath);
+
+                            // Ensure video dimensions are populated for detail views
+                            var videoInfo = GetVideoInfo(fullPath);
+                            if (videoInfo.Width > 0 && videoInfo.Height > 0)
+                            {
+                                image.UpdateMetadata(videoInfo.Width, videoInfo.Height, mediaFile.FileSize);
+                            }
                         }
                         catch (Exception ex)
                         {
