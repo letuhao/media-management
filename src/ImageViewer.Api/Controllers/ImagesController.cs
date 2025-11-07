@@ -1,3 +1,4 @@
+using ImageViewer.Api.DTOs;
 using ImageViewer.Application.DTOs.Common;
 using ImageViewer.Application.Extensions;
 using ImageViewer.Application.Services;
@@ -114,6 +115,56 @@ public class ImagesController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error getting images for collection {CollectionId}", collectionId);
+            return StatusCode(500, "Internal server error");
+        }
+    }
+
+    /// <summary>
+    /// Get unified media items (images & videos) for a collection with URLs for playback/preview.
+    /// </summary>
+    [HttpGet("collection/{collectionId}/media")]
+    public async Task<ActionResult<PaginationResponseDto<MediaItemDto>>> GetMediaByCollection(
+        ObjectId collectionId,
+        [FromQuery] PaginationRequestDto pagination,
+        [FromQuery] int? limit = null,
+        [FromQuery] bool? filterValidOnly = false)
+    {
+        try
+        {
+            if (limit.HasValue)
+            {
+                pagination.PageSize = limit.Value;
+            }
+
+            var images = filterValidOnly == true
+                ? await _imageService.GetDisplayableImagesByCollectionAsync(collectionId)
+                : await _imageService.GetEmbeddedImagesByCollectionAsync(collectionId);
+
+            var totalCount = images.Count();
+
+            var mediaItems = images
+                .AsQueryable()
+                .ApplySorting(pagination.SortBy, pagination.SortDirection)
+                .ApplyPagination(pagination)
+                .Select(image => CreateMediaItemDto(collectionId, image))
+                .ToList();
+
+            var response = new PaginationResponseDto<MediaItemDto>
+            {
+                Data = mediaItems,
+                TotalCount = totalCount,
+                Page = pagination.Page,
+                PageSize = pagination.PageSize,
+                TotalPages = (int)Math.Ceiling(totalCount / (double)pagination.PageSize),
+                HasNextPage = pagination.Page * pagination.PageSize < totalCount,
+                HasPreviousPage = pagination.Page > 1
+            };
+
+            return Ok(response);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting media items for collection {CollectionId}", collectionId);
             return StatusCode(500, "Internal server error");
         }
     }
@@ -258,6 +309,40 @@ public class ImagesController : ControllerBase
         }
     }
 
+    private MediaItemDto CreateMediaItemDto(ObjectId collectionId, ImageEmbedded image)
+    {
+        var isVideo = IsVideoFormat(image.Format);
+        var collectionIdString = collectionId.ToString();
+
+        var thumbnailUrl = Url.Action(
+            nameof(GetImageThumbnail),
+            values: new { collectionId = collectionIdString, imageId = image.Id });
+
+        var mediaUrl = Url.Action(
+            nameof(GetImageFile),
+            values: new { collectionId = collectionIdString, imageId = image.Id });
+
+        thumbnailUrl ??= $"/api/v1/images/{collectionIdString}/{image.Id}/thumbnail";
+        mediaUrl ??= $"/api/v1/images/{collectionIdString}/{image.Id}/file";
+
+        return new MediaItemDto
+        {
+            Id = image.Id,
+            CollectionId = collectionIdString,
+            Filename = image.Filename,
+            RelativePath = image.RelativePath,
+            Format = image.Format,
+            FileSize = image.FileSize,
+            Width = image.Width,
+            Height = image.Height,
+            IsVideo = isVideo,
+            MediaType = isVideo ? "video" : "image",
+            ThumbnailUrl = thumbnailUrl,
+            MediaUrl = mediaUrl,
+            Source = image
+        };
+    }
+
     private static string GetContentType(string format)
     {
         return format.ToLowerInvariant() switch
@@ -277,6 +362,20 @@ public class ImagesController : ControllerBase
             "mkv" => "video/x-matroska",
             "webm" => "video/webm",
             _ => "application/octet-stream"
+        };
+    }
+
+    private static bool IsVideoFormat(string format)
+    {
+        if (string.IsNullOrWhiteSpace(format))
+        {
+            return false;
+        }
+
+        return format.ToLowerInvariant() switch
+        {
+            "mp4" or "avi" or "mov" or "wmv" or "flv" or "mkv" or "webm" or "m4v" or "3gp" or "mpg" or "mpeg" => true,
+            _ => false,
         };
     }
 

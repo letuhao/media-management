@@ -9,6 +9,7 @@ import { useHotkeys, CommonHotkeys } from '../hooks/useHotkeys';
 import { useRandomNavigation } from '../hooks/useRandomNavigation';
 import LoadingSpinner from '../components/ui/LoadingSpinner';
 import MediaDisplay from '../components/media/MediaDisplay';
+import { isVideoFile } from '../utils/mediaUtils';
 import { useUI } from '../contexts/UIContext';
 import CollectionNavigationSidebar from '../components/collections/CollectionNavigationSidebar';
 import ImagePreviewSidebar from '../components/viewer/ImagePreviewSidebar';
@@ -803,12 +804,12 @@ const ImageViewer: React.FC = () => {
         <div className="flex-1 flex flex-col">
       {/* Header */}
       {!hideAllControls && (
-        <div className="absolute top-0 left-0 right-0 z-10 bg-gradient-to-b from-black/80 to-transparent p-4">
-        <div className="flex items-center justify-between">
+        <div className="absolute top-0 left-0 right-0 z-[1] p-4 pointer-events-none">
+        <div className="flex items-center justify-between pointer-events-auto">
           <div className="flex items-center space-x-4">
             <button
               onClick={toggleCollectionSidebar}
-              className={`p-2 hover:bg-white/10 rounded-lg transition-colors ${
+              className={`p-2 rounded-lg transition-colors ${
                 showCollectionSidebar ? 'bg-primary-500' : ''
               }`}
               title={showCollectionSidebar ? 'Hide Collections' : 'Show Collections'}
@@ -817,7 +818,7 @@ const ImageViewer: React.FC = () => {
             </button>
             <button
               onClick={() => navigate(`/collections/${collectionId}`)}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
             >
               <X className="h-6 w-6 text-white" />
             </button>
@@ -837,7 +838,7 @@ const ImageViewer: React.FC = () => {
             {/* Navigation Mode Toggle */}
             <button
               onClick={toggleNavigationMode}
-              className={`p-2 hover:bg-white/10 rounded-lg transition-colors ${
+              className={`p-2 rounded-lg transition-colors ${
                 navigationMode === 'scroll' ? 'bg-primary-500' : ''
               }`}
               title={navigationMode === 'paging' ? 'Switch to Scroll Mode' : 'Switch to Paging Mode'}
@@ -849,7 +850,7 @@ const ImageViewer: React.FC = () => {
             <button
               onClick={toggleCrossCollectionNav}
               disabled={navigationMode === 'scroll' || isShuffleMode}
-              className={`p-2 hover:bg-white/10 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+              className={`p-2 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
                 crossCollectionNav ? 'bg-purple-500' : ''
               }`}
               title={
@@ -868,7 +869,7 @@ const ImageViewer: React.FC = () => {
             {/* Auto-Rotate Mode Toggle */}
             <button
               onClick={toggleAutoRotateMode}
-              className={`p-2 hover:bg-white/10 rounded-lg transition-colors ${
+              className={`p-2 rounded-lg transition-colors ${
                 autoRotateMode === 'portrait' ? 'bg-blue-500' : 
                 autoRotateMode === 'landscape' ? 'bg-green-500' : ''
               }`}
@@ -890,7 +891,7 @@ const ImageViewer: React.FC = () => {
                 className={`p-1.5 rounded transition-colors ${
                   viewMode === 'single'
                     ? 'bg-primary-500 text-white'
-                    : 'text-slate-300 hover:text-white hover:bg-white/10'
+                    : 'text-slate-300 hover:text-white'
                 }`}
                 title="Single View (1)"
               >
@@ -901,7 +902,7 @@ const ImageViewer: React.FC = () => {
                 className={`p-1.5 rounded transition-colors ${
                   viewMode === 'double'
                     ? 'bg-primary-500 text-white'
-                    : 'text-slate-300 hover:text-white hover:bg-white/10'
+                    : 'text-slate-300 hover:text-white'
                 }`}
                 title="Double Page View (2)"
               >
@@ -912,7 +913,7 @@ const ImageViewer: React.FC = () => {
                 className={`p-1.5 rounded transition-colors ${
                   viewMode === 'triple'
                     ? 'bg-primary-500 text-white'
-                    : 'text-slate-300 hover:text-white hover:bg-white/10'
+                    : 'text-slate-300 hover:text-white'
                 }`}
                 title="Triple Page View (3)"
               >
@@ -923,7 +924,7 @@ const ImageViewer: React.FC = () => {
                 className={`p-1.5 rounded transition-colors ${
                   viewMode === 'quad'
                     ? 'bg-primary-500 text-white'
-                    : 'text-slate-300 hover:text-white hover:bg-white/10'
+                    : 'text-slate-300 hover:text-white'
                 }`}
                 title="Quad View (4)"
               >
@@ -933,14 +934,14 @@ const ImageViewer: React.FC = () => {
 
             <button
               onClick={() => setShowInfo(!showInfo)}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
               title="Toggle Info (I)"
             >
               <Info className="h-5 w-5 text-white" />
             </button>
             <button
               onClick={toggleFitToScreen}
-              className={`p-2 hover:bg-white/10 rounded-lg transition-colors ${
+              className={`p-2 rounded-lg transition-colors ${
                 fitToScreen ? 'bg-primary-500' : ''
               }`}
               title={fitToScreen ? "Fit to Viewport" : "Fit to Screen (100vh/100vw)"}
@@ -949,21 +950,21 @@ const ImageViewer: React.FC = () => {
             </button>
             <button
               onClick={() => setRotation((r) => (r + 90) % 360)}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
               title="Rotate (R)"
             >
               <RotateCw className="h-5 w-5 text-white" />
             </button>
             <button
               onClick={() => setRotation((r) => (r + 180) % 360)}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
               title="Flip (Ctrl+F)"
             >
               <RotateCcw className="h-5 w-5 text-white" />
             </button>
             <button
               onClick={() => setZoom((z) => Math.max(z - 0.25, 0.25))}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
               title="Zoom Out (-)"
             >
               <ZoomOut className="h-5 w-5 text-white" />
@@ -976,14 +977,14 @@ const ImageViewer: React.FC = () => {
             </span>
             <button
               onClick={() => setZoom((z) => Math.min(z + 0.25, 5))}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
               title="Zoom In (+)"
             >
               <ZoomIn className="h-5 w-5 text-white" />
             </button>
             <button
               onClick={toggleFullscreen}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
               title="Fullscreen (F)"
             >
               <Maximize2 className="h-5 w-5 text-white" />
@@ -1008,7 +1009,7 @@ const ImageViewer: React.FC = () => {
               <button
                 onClick={() => setIsShuffleMode(!isShuffleMode)}
                 className={`p-1.5 rounded transition-colors ${
-                  isShuffleMode ? 'bg-primary-500 text-white' : 'text-slate-300 hover:text-white hover:bg-white/10'
+                  isShuffleMode ? 'bg-primary-500 text-white' : 'text-slate-300 hover:text-white'
                 }`}
                 title="Shuffle Mode"
               >
@@ -1017,7 +1018,7 @@ const ImageViewer: React.FC = () => {
               <button
                 onClick={() => setIsSlideshow(!isSlideshow)}
                 className={`p-1.5 rounded transition-colors ${
-                  isSlideshow ? 'bg-primary-500 text-white' : 'text-slate-300 hover:text-white hover:bg-white/10'
+                  isSlideshow ? 'bg-primary-500 text-white' : 'text-slate-300 hover:text-white'
                 }`}
                 title="Slideshow (Space)"
               >
@@ -1032,7 +1033,7 @@ const ImageViewer: React.FC = () => {
             {/* Image Preview Sidebar Toggle */}
             <button
               onClick={toggleImagePreviewSidebar}
-              className={`p-2 hover:bg-white/10 rounded-lg transition-colors ${
+              className={`p-2 rounded-lg transition-colors ${
                 showImagePreviewSidebar ? 'bg-primary-500' : ''
               }`}
               title={showImagePreviewSidebar ? 'Hide Thumbnails (T)' : 'Show Thumbnails (T)'}
@@ -1043,7 +1044,7 @@ const ImageViewer: React.FC = () => {
             {/* Help Button */}
             <button
               onClick={() => setShowHelp(!showHelp)}
-              className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+              className="p-2 rounded-lg transition-colors"
               title="Help (? or H)"
             >
               <HelpCircle className="h-5 w-5 text-white" />
@@ -1072,8 +1073,10 @@ const ImageViewer: React.FC = () => {
                   <div className="absolute -inset-2 border-2 border-primary-500 rounded-lg pointer-events-none"></div>
                 )}
                 <MediaDisplay
+                  key={image.id} // Force re-render when image changes for proper video playback
                   src={`/api/v1/images/${collectionId}/${image.id}/file`}
                   alt={image.filename}
+                  filename={image.filename}
                   className={getImageClass()}
                   style={{
                     transform: `scale(${zoom * getAutoRotatedScale(image.width, image.height)}) rotate(${rotation + getAutoRotation(image.width, image.height)}deg)`,
@@ -1082,9 +1085,9 @@ const ImageViewer: React.FC = () => {
                   }}
                   loading="lazy"
                   controls={true}
-                  autoPlay={false}
-                  muted={true}
-                  loop={false}
+                  autoPlay={isVideoFile(image.filename)} // Auto-play videos like TikTok/YouTube Shorts
+                  muted={!isVideoFile(image.filename)} // Unmute videos, mute images (for animated GIFs)
+                  loop={isVideoFile(image.filename)} // Loop videos like GIFs
                 />
                 <div className="mt-2 text-white text-sm text-center">
                   {index + 1} / {images.length} - {image.filename}
@@ -1140,8 +1143,10 @@ const ImageViewer: React.FC = () => {
                 </div>
               )}
               <MediaDisplay
+                key={`${image.id}-${index}`} // Force re-render when image changes for proper video playback
                 src={`/api/v1/images/${collectionId}/${image.id}/file`}
                 alt={image.filename}
+                filename={image.filename}
                 className={getImageClass()}
                 style={{
                   transform: `scale(${zoom * getAutoRotatedScale(image.width, image.height)}) rotate(${rotation + getAutoRotation(image.width, image.height)}deg)`,
@@ -1154,9 +1159,9 @@ const ImageViewer: React.FC = () => {
                   }
                 }}
                 controls={true}
-                autoPlay={false}
-                muted={true}
-                loop={false}
+                autoPlay={isVideoFile(image.filename)} // Auto-play videos like TikTok/YouTube Shorts
+                muted={!isVideoFile(image.filename)} // Unmute videos, mute images (for animated GIFs)
+                loop={isVideoFile(image.filename)} // Loop videos like GIFs
               />
               {/* Image index indicator for multi-view */}
               {viewMode !== 'single' && (
@@ -1202,8 +1207,8 @@ const ImageViewer: React.FC = () => {
 
       {/* Info Panel */}
       {showInfo && (
-        <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-6">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-white">
+        <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/40 to-transparent p-6 pointer-events-none">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-white pointer-events-auto">
             <div>
               <p className="text-sm text-slate-400">Filename</p>
               <p className="font-medium">{currentImage.filename}</p>
