@@ -54,7 +54,7 @@ public class BulkService : IBulkService
             var potentialCollections = await FindPotentialCollections(
                 request.ParentPath, 
                 request.IncludeSubfolders, 
-                request.CollectionPrefix);
+                request.CollectionPrefix ?? string.Empty);
             
             _logger.LogInformation("Found {Count} potential collections", potentialCollections.Count);
             
@@ -118,6 +118,30 @@ public class BulkService : IBulkService
             existingCollection = null;
         }
         
+        // Determine direct mode setting:
+        // IMPORTANT: We do NOT auto-enable UseDirectFileAccess setting for videos
+        // Videos will automatically use direct mode behavior during scanning without changing collection setting
+        // This preserves existing collection settings for old collections
+        bool shouldUseDirectMode;
+        
+        if (request.UseDirectFileAccess)
+        {
+            // Explicit setting always takes precedence
+            shouldUseDirectMode = true;
+        }
+        else if (existingCollection != null)
+        {
+            // Always preserve existing collection's direct mode setting
+            // Videos will automatically use direct mode behavior during scan, but setting stays unchanged
+            shouldUseDirectMode = existingCollection.Settings?.UseDirectFileAccess ?? false;
+        }
+        else
+        {
+            // New collection: Use explicit setting or default to false
+            // Videos will automatically use direct mode behavior during scan, but setting stays false
+            shouldUseDirectMode = false;
+        }
+        
         Collection collection;
         bool wasOverwritten = false;
         
@@ -147,7 +171,7 @@ public class BulkService : IBulkService
                 collection = await _collectionService.UpdateCollectionAsync(existingCollection.Id, updateRequest);
                 
                 // Apply collection settings with force rescan
-                var settings = CreateCollectionSettings(request);
+                var settings = CreateCollectionSettings(request, shouldUseDirectMode);
                 var settingsRequest = new UpdateCollectionSettingsRequest
                 {
                     AutoScan = settings.AutoScan,
@@ -183,7 +207,7 @@ public class BulkService : IBulkService
                         potential.Name, imageCount, thumbnailCount, cacheCount, missingThumbnails, missingCache);
                     
                     // Check if direct mode is enabled AND collection is directory
-                    var useDirectMode = request.UseDirectFileAccess && existingCollection.Type == CollectionType.Folder;
+                    var useDirectMode = shouldUseDirectMode && existingCollection.Type == CollectionType.Folder;
                     
                     if (useDirectMode)
                     {
@@ -250,7 +274,7 @@ public class BulkService : IBulkService
                 collection = await _collectionService.UpdateCollectionAsync(existingCollection.Id, updateRequest);
                 
                 // Apply collection settings and queue scan
-                var settings = CreateCollectionSettings(request);
+                var settings = CreateCollectionSettings(request, shouldUseDirectMode);
                 var settingsRequest = new UpdateCollectionSettingsRequest
                 {
                     AutoScan = settings.AutoScan,
@@ -301,7 +325,7 @@ public class BulkService : IBulkService
                 createdBySystem: "ImageViewer.Worker");
             
             // Apply collection settings after creation
-            var settings = CreateCollectionSettings(request);
+            var settings = CreateCollectionSettings(request, shouldUseDirectMode);
             var settingsRequest = new UpdateCollectionSettingsRequest
             {
                 AutoScan = settings.AutoScan,
@@ -337,7 +361,7 @@ public class BulkService : IBulkService
         };
     }
 
-    private static CollectionSettings CreateCollectionSettings(BulkAddCollectionsRequest request)
+    private static CollectionSettings CreateCollectionSettings(BulkAddCollectionsRequest request, bool useDirectFileAccess)
     {
         var settings = new CollectionSettings();
         settings.UpdateThumbnailSize(request.ThumbnailWidth ?? 300);
@@ -346,7 +370,8 @@ public class BulkService : IBulkService
         // Map AutoScan to AutoGenerateCache - when AutoScan is true, enable auto cache generation
         settings.SetAutoGenerateCache(request.AutoScan ?? true);
         // Set direct file access mode (only effective for directory collections)
-        settings.SetDirectFileAccess(request.UseDirectFileAccess);
+        // This can be automatically enabled for video collections
+        settings.SetDirectFileAccess(useDirectFileAccess);
         return settings;
     }
 
@@ -414,7 +439,7 @@ public class BulkService : IBulkService
             {
                 var directoryName = Path.GetFileName(directory);
                 
-                // Check if directory contains images
+                // Check if directory contains media files (images or videos)
                 var hasImages = await HasImageFiles(directory);
                 if (hasImages)
                 {
@@ -450,7 +475,7 @@ public class BulkService : IBulkService
                         continue;
                     }
                     
-                    // Check if compressed file contains images
+                    // Check if compressed file contains media files (images or videos)
                     var hasImages = await HasImagesInCompressedFile(file);
                     if (hasImages)
                     {
@@ -473,7 +498,7 @@ public class BulkService : IBulkService
                     }
                     else
                     {
-                        _logger.LogDebug("Skipping file {FileName} - no images found", fileName);
+                        _logger.LogDebug("Skipping file {FileName} - no media files found", fileName);
                     }
                 }
             }
@@ -487,19 +512,89 @@ public class BulkService : IBulkService
         return potentialCollections;
     }
     
+    private async Task<bool> CollectionContainsVideosAsync(PotentialCollection potential)
+    {
+        try
+        {
+            var videoExtensions = new[] { 
+                ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg"
+            };
+            
+            if (potential.Type == CollectionType.Folder)
+            {
+                // Check folder for video files
+                var files = Directory.GetFiles(potential.Path, "*", SearchOption.TopDirectoryOnly);
+                return files.Any(file => 
+                    videoExtensions.Contains(Path.GetExtension(file).ToLowerInvariant()));
+            }
+            else
+            {
+                // Check compressed archive for video files
+                return await HasVideosInCompressedFileAsync(potential.Path);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error checking if collection {Name} contains videos, defaulting to false", potential.Name);
+            return false;
+        }
+    }
+    
+    private Task<bool> HasVideosInCompressedFileAsync(string filePath)
+    {
+        try
+        {
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+            var videoExtensions = new[] { 
+                ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg"
+            };
+            
+            // Use SharpCompress for robust archive reading
+            if (new[] { ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".cbz", ".cbr" }.Contains(extension))
+            {
+                using var archive = ArchiveFactory.Open(filePath);
+                
+                // Check if any entry has a video extension
+                var hasVideos = archive.Entries
+                    .Where(e => !e.IsDirectory)
+                    .Where(entry => MacOSXFilterHelper.IsSafeToProcess(entry.Key, "archive video check"))
+                    .Any(entry => 
+                    {
+                        var ext = Path.GetExtension(entry.Key);
+                        return !string.IsNullOrEmpty(ext) && videoExtensions.Contains(ext.ToLowerInvariant());
+                    });
+                
+                _logger.LogDebug("Archive {FilePath} has videos: {HasVideos}", filePath, hasVideos);
+                return Task.FromResult(hasVideos);
+            }
+            
+            // For other compressed formats, assume no videos (archives typically contain images)
+            return Task.FromResult(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error checking videos in compressed file {FilePath}", filePath);
+            return Task.FromResult(false);
+        }
+    }
+    
     private Task<bool> HasImageFiles(string directory)
     {
         try
         {
-            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".svg" };
+            // Check for both image and video files (media files)
+            var mediaExtensions = new[] { 
+                ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".svg",
+                ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg"
+            };
             
             // CRITICAL FIX: Use TopDirectoryOnly to check ONLY direct children
-            // We want LEAF folders only (folders that directly contain images)
-            // NOT intermediate folders that have subfolders with images
+            // We want LEAF folders only (folders that directly contain media files)
+            // NOT intermediate folders that have subfolders with media files
             // 
             // Example structure:
-            // L:\EMedia\AI_Generated\         ← NO images directly here → NOT a collection
-            //   └── AiASAG\                   ← Images here → IS a collection
+            // L:\EMedia\AI_Generated\         ← NO media directly here → NOT a collection
+            //   └── AiASAG\                   ← Media here → IS a collection
             //       └── image1.jpg
             //
             // Before fix: Both AI_Generated AND AiASAG were added as collections (wrong!)
@@ -507,7 +602,7 @@ public class BulkService : IBulkService
             var files = Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly);
             
             return Task.FromResult(files.Any(file => 
-                imageExtensions.Contains(Path.GetExtension(file).ToLowerInvariant())));
+                mediaExtensions.Contains(Path.GetExtension(file).ToLowerInvariant())));
         }
         catch
         {
@@ -520,7 +615,11 @@ public class BulkService : IBulkService
         try
         {
             var extension = Path.GetExtension(filePath).ToLowerInvariant();
-            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".svg" };
+            // Check for both image and video files (media files)
+            var mediaExtensions = new[] { 
+                ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".svg",
+                ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg"
+            };
             
             // Use SharpCompress for robust archive reading (handles partial corruption like 7-Zip)
             // Supports: ZIP, RAR, 7Z, TAR, GZIP, BZIP2, CBZ, CBR, etc.
@@ -528,19 +627,23 @@ public class BulkService : IBulkService
             {
                 using var archive = ArchiveFactory.Open(filePath);
                 
-                // Check if any entry has an image extension
+                // Check if any entry has a media extension (images or videos)
                 // SharpCompress can read good entries even if some are corrupted
                 // CRITICAL FIX: Filter out __MACOSX metadata entries to prevent broken collections
-                var hasImages = archive.Entries
+                var hasMedia = archive.Entries
                     .Where(e => !e.IsDirectory)
-                    .Where(entry => MacOSXFilterHelper.IsSafeToProcess(entry.Key, "archive image check"))
-                    .Any(entry => imageExtensions.Contains(Path.GetExtension(entry.Key).ToLowerInvariant()));
+                    .Where(entry => MacOSXFilterHelper.IsSafeToProcess(entry.Key, "archive media check"))
+                    .Any(entry => 
+                    {
+                        var ext = Path.GetExtension(entry.Key);
+                        return !string.IsNullOrEmpty(ext) && mediaExtensions.Contains(ext.ToLowerInvariant());
+                    });
                 
-                _logger.LogDebug("Archive {FilePath} has images: {HasImages}", filePath, hasImages);
-                return Task.FromResult(hasImages);
+                _logger.LogDebug("Archive {FilePath} has media files: {HasMedia}", filePath, hasMedia);
+                return Task.FromResult(hasMedia);
             }
             
-            // For other compressed formats, assume they contain images if they exist
+            // For other compressed formats, assume they contain media if they exist
             var exists = System.IO.File.Exists(filePath);
             _logger.LogDebug("Compressed file {FilePath} exists: {Exists}", filePath, exists);
             return Task.FromResult(exists);

@@ -7,6 +7,7 @@ using SkiaSharp;
 using System.Collections.Concurrent;
 using SharpCompress.Archives;
 using ImageViewer.Application.Helpers;
+using FFMpegCore;
 
 namespace ImageViewer.Infrastructure.Services;
 
@@ -170,13 +171,22 @@ public class MemoryOptimizedImageProcessingService : IImageProcessingService
     {
         try
         {
-            _logger.LogDebug("🎨 Generating thumbnail from file: {ImagePath}, {Width}x{Height}", archiveEntry.GetPhysicalFileFullPath(), width, height);
+            var filePath = archiveEntry.GetPhysicalFileFullPath();
+            _logger.LogDebug("🎨 Generating thumbnail from file: {ImagePath}, {Width}x{Height}", filePath, width, height);
 
-            // Read entire file into memory for processing
-            var imageBytes = await ReadFileToMemoryAsync(archiveEntry.GetPhysicalFileFullPath(), cancellationToken);
+            // Check if this is a video file
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+            if (IsVideoFile(extension))
+            {
+                _logger.LogDebug("🎬 Detected video file, extracting frame for thumbnail: {FilePath}", filePath);
+                return await GenerateVideoThumbnailAsync(filePath, width, height, format, quality, cancellationToken);
+            }
+
+            // Handle image files - read entire file into memory for processing
+            var imageBytes = await ReadFileToMemoryAsync(filePath, cancellationToken);
             if (imageBytes == null || imageBytes.Length == 0)
             {
-                throw new InvalidOperationException($"Failed to read image file: {archiveEntry.GetPhysicalFileFullPath()}");
+                throw new InvalidOperationException($"Failed to read image file: {filePath}");
             }
 
             // Process in memory
@@ -192,6 +202,94 @@ public class MemoryOptimizedImageProcessingService : IImageProcessingService
             _logger.LogError(ex, "❌ Error generating thumbnail from file {ImagePath}", archiveEntry.GetPhysicalFileFullPath());
             throw;
         }
+    }
+
+    /// <summary>
+    /// Generate thumbnail from video file by extracting a frame
+    /// </summary>
+    private async Task<byte[]> GenerateVideoThumbnailAsync(string videoPath, int width, int height, string format, int quality, CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Create temporary file for the extracted frame
+            var tempFramePath = Path.Combine(Path.GetTempPath(), $"video_frame_{Guid.NewGuid()}.jpg");
+            
+            try
+            {
+                // Extract a frame from the video (at 1 second or 10% of duration, whichever is smaller)
+                var mediaInfo = FFProbe.Analyse(videoPath);
+                var duration = mediaInfo.Duration;
+                var videoStream = mediaInfo.VideoStreams.FirstOrDefault();
+                
+                if (videoStream == null)
+                {
+                    _logger.LogWarning("⚠️ No video stream found in {VideoPath}", videoPath);
+                    throw new InvalidOperationException($"No video stream found in {videoPath}");
+                }
+
+                // Use 1 second or 10% of duration, whichever is smaller, but at least 0.1 seconds
+                var seekTime = duration.TotalSeconds > 0 
+                    ? Math.Min(1.0, Math.Max(0.1, duration.TotalSeconds * 0.1))
+                    : 0.5;
+                
+                _logger.LogDebug("Extracting frame from {VideoPath} at {SeekTime} seconds", videoPath, seekTime);
+
+                // Use FFMpeg to extract frame as JPEG (size is null to use original size, captureTime specifies when to capture)
+                FFMpeg.Snapshot(videoPath, tempFramePath, size: null, captureTime: TimeSpan.FromSeconds(seekTime));
+                
+                if (!File.Exists(tempFramePath))
+                {
+                    throw new FileNotFoundException($"Failed to extract frame from video: {videoPath}");
+                }
+
+                // Read the extracted frame into memory and process it
+                var frameBytes = await File.ReadAllBytesAsync(tempFramePath, cancellationToken);
+                if (frameBytes == null || frameBytes.Length == 0)
+                {
+                    throw new InvalidOperationException($"Failed to read extracted frame: {tempFramePath}");
+                }
+
+                // Process the frame using existing thumbnail generation
+                var result = await GenerateThumbnailFromBytesAsync(frameBytes, width, height, format, quality, cancellationToken);
+                
+                if (result == null || result.Length == 0)
+                {
+                    throw new InvalidOperationException("Failed to generate thumbnail from video frame");
+                }
+                
+                _logger.LogDebug("✅ Successfully generated video thumbnail: {Size} bytes, format {Format}", result.Length, format);
+                return result;
+            }
+            finally
+            {
+                // Clean up temporary frame file
+                try
+                {
+                    if (File.Exists(tempFramePath))
+                    {
+                        File.Delete(tempFramePath);
+                    }
+                }
+                catch (Exception cleanupEx)
+                {
+                    _logger.LogWarning(cleanupEx, "Failed to delete temporary frame file: {TempPath}", tempFramePath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Error generating video thumbnail for {VideoPath}", videoPath);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Check if file extension is a video format
+    /// </summary>
+    private static bool IsVideoFile(string extension)
+    {
+        var videoExtensions = new[] { ".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm", ".m4v", ".3gp", ".mpg", ".mpeg" };
+        return videoExtensions.Contains(extension.ToLowerInvariant());
     }
 
     public async Task<ImageDimensions?> GetImageDimensionsAsync(ArchiveEntryInfo archiveEntry, CancellationToken cancellationToken = default)

@@ -140,8 +140,20 @@ public class CollectionScanConsumer : BaseMessageConsumer
             _logger.LogDebug("📁 Found {FileCount} media files in collection {CollectionId}", 
                 mediaFiles.Count, collection.Id);
 
-            // Check if direct file access mode is enabled and valid for this collection
-            var useDirectAccess = scanMessage.UseDirectFileAccess && collection.Type == CollectionType.Folder;
+            // Check if collection contains videos (videos automatically use direct mode behavior)
+            // This allows videos to use direct mode without changing collection settings
+            bool hasVideos = mediaFiles.Any(f => IsVideoFile(f.Extension));
+            
+            // Use direct mode if:
+            // 1. Explicitly enabled in collection settings/scan message, OR
+            // 2. Collection contains videos (videos always use direct mode behavior)
+            var useDirectAccess = (scanMessage.UseDirectFileAccess || hasVideos) && collection.Type == CollectionType.Folder;
+            
+            if (hasVideos && !scanMessage.UseDirectFileAccess)
+            {
+                _logger.LogInformation("🎥 Collection {Name} contains {VideoCount} video files, automatically using direct mode behavior (setting unchanged)", 
+                    collection.Name, mediaFiles.Count(f => IsVideoFile(f.Extension)));
+            }
             
             if (useDirectAccess)
             {
@@ -351,7 +363,7 @@ public class CollectionScanConsumer : BaseMessageConsumer
             foreach (var entry in archive.Entries)
             {
                 // CRITICAL FIX: Filter out __MACOSX metadata entries to prevent broken collections
-                if (!entry.IsDirectory && MacOSXFilterHelper.IsSafeToProcess(entry.Key, "collection scanning") && IsMediaFile(entry.Key))
+                if (!entry.IsDirectory && !string.IsNullOrEmpty(entry.Key) && MacOSXFilterHelper.IsSafeToProcess(entry.Key, "collection scanning") && IsMediaFile(entry.Key))
                 {
                     mediaFiles.Add(new MediaFileInfo
                     {
