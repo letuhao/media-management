@@ -51,12 +51,60 @@ export const MediaDisplay: React.FC<MediaDisplayProps> = ({
   const [isUserScrubbing, setIsUserScrubbing] = useState(false);
   const [scrubbingValue, setScrubbingValue] = useState<number | null>(null); // Track scrubbing value separately
   const hideControlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSeekRef = useRef<number | null>(null);
   
   // Use provided filename if available, otherwise try to extract from URL
   const filename = providedFilename || src.split('/').pop() || '';
   const isVideo = isVideoFile(filename);
 
   const seekStep = isShortVideo ? 0.05 : 0.5;
+
+  const getEffectiveDuration = useCallback(() => {
+    const video = videoRef.current;
+    if (video) {
+      if (typeof video.duration === 'number' && Number.isFinite(video.duration) && video.duration > 0) {
+        return video.duration;
+      }
+      if (video.seekable && video.seekable.length > 0) {
+        const end = video.seekable.end(video.seekable.length - 1);
+        if (Number.isFinite(end) && end > 0) {
+          return end;
+        }
+      }
+    }
+    if (Number.isFinite(duration) && duration > 0) {
+      return duration;
+    }
+    return null;
+  }, [duration]);
+
+  const clampToDuration = useCallback((value: number) => {
+    if (!Number.isFinite(value)) {
+      return 0;
+    }
+
+    const effectiveDuration = getEffectiveDuration();
+    if (effectiveDuration && effectiveDuration > 0) {
+      return Math.min(Math.max(0, value), effectiveDuration);
+    }
+
+    return Math.max(0, value);
+  }, [getEffectiveDuration]);
+
+  const canSeekImmediately = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) {
+      return false;
+    }
+    if (video.readyState >= 1 && Number.isFinite(video.duration) && video.duration > 0) {
+      return true;
+    }
+    if (video.seekable && video.seekable.length > 0) {
+      const end = video.seekable.end(video.seekable.length - 1);
+      return Number.isFinite(end) && end > 0;
+    }
+    return false;
+  }, []);
 
   const formatTime = (value: number): string => {
     if (!isFinite(value)) return '0:00';
@@ -65,6 +113,14 @@ export const MediaDisplay: React.FC<MediaDisplayProps> = ({
     const seconds = totalSeconds % 60;
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
+
+  const applySeek = useCallback((video: HTMLVideoElement, target: number) => {
+    const clamped = clampToDuration(target);
+    video.currentTime = clamped;
+    setCurrentTime(clamped);
+    setScrubbingValue(null);
+    pendingSeekRef.current = null;
+  }, [clampToDuration]);
 
   const togglePlayPause = () => {
     const video = videoRef.current;
@@ -88,12 +144,17 @@ export const MediaDisplay: React.FC<MediaDisplayProps> = ({
 
   const handleSeek = useCallback((value: number) => {
     const video = videoRef.current;
-    if (!video || Number.isNaN(value) || !isFinite(value)) return;
-    const clampedValue = Math.max(0, Math.min(value, duration || 0));
-    video.currentTime = clampedValue;
-    setCurrentTime(clampedValue);
-    setScrubbingValue(null); // Clear scrubbing value after seek
-  }, [duration]);
+    if (!video || Number.isNaN(value) || !Number.isFinite(value)) return;
+
+    const clampedValue = clampToDuration(value);
+    if (canSeekImmediately()) {
+      applySeek(video, clampedValue);
+    } else {
+      pendingSeekRef.current = clampedValue;
+      setCurrentTime(clampedValue);
+      setScrubbingValue(null);
+    }
+  }, [applySeek, canSeekImmediately, clampToDuration]);
 
   const handleToggleFullscreen = () => {
     const video = videoRef.current;
@@ -114,13 +175,17 @@ export const MediaDisplay: React.FC<MediaDisplayProps> = ({
     
     // Detect if video is short (less than 60 seconds) for better timeline control
     const handleLoadedMetadata = () => {
-      if (video.duration) {
+      if (Number.isFinite(video.duration) && video.duration > 0) {
         setDuration(video.duration);
         setIsShortVideo(video.duration < 60);
-        
-        if (onLoad) {
-          onLoad();
-        }
+      }
+
+      if (pendingSeekRef.current !== null) {
+        applySeek(video, pendingSeekRef.current);
+      }
+
+      if (onLoad) {
+        onLoad();
       }
     };
     
@@ -328,7 +393,11 @@ export const MediaDisplay: React.FC<MediaDisplayProps> = ({
       window.removeEventListener('mouseup', handlePointerUp);
       window.removeEventListener('touchend', handlePointerUp);
     };
-  }, [controls, isUserScrubbing, scrubbingValue, duration, handleSeek]);
+  }, [controls, isUserScrubbing, scrubbingValue, handleSeek]);
+
+  const effectiveDuration = getEffectiveDuration();
+  const sliderMax = effectiveDuration ?? duration ?? 0;
+  const displayDuration = effectiveDuration ?? duration ?? 0;
   
   if (isVideo) {
     return (
@@ -432,18 +501,28 @@ export const MediaDisplay: React.FC<MediaDisplayProps> = ({
                     <input
                       type="range"
                       min={0}
-                      max={duration || 0}
+                      max={sliderMax}
                       step={seekStep}
-                      value={scrubbingValue !== null ? scrubbingValue : Math.min(currentTime, duration || 0)}
+                      value={scrubbingValue !== null ? scrubbingValue : currentTime}
                       onChange={(event) => {
                         setShowControls(true);
                         const newValue = parseFloat(event.target.value);
-                        setScrubbingValue(newValue);
-                        // Update video immediately while scrubbing for better responsiveness
-                        const video = videoRef.current;
-                        if (video && !Number.isNaN(newValue) && isFinite(newValue)) {
-                          video.currentTime = Math.max(0, Math.min(newValue, duration || 0));
+                        if (Number.isNaN(newValue)) {
+                          return;
                         }
+
+                        const clampedValue = clampToDuration(newValue);
+                        setScrubbingValue(clampedValue);
+
+                        const video = videoRef.current;
+                        if (video && canSeekImmediately()) {
+                          video.currentTime = clampedValue;
+                        } else {
+                          pendingSeekRef.current = clampedValue;
+                        }
+
+                        // Update label immediately (especially when paused)
+                        setCurrentTime(clampedValue);
                       }}
                       onMouseDown={() => {
                         setIsUserScrubbing(true);
@@ -466,11 +545,11 @@ export const MediaDisplay: React.FC<MediaDisplayProps> = ({
                           handleSeek(value);
                         }, 0);
                       }}
-                      disabled={!duration}
+                      disabled={!sliderMax}
                       className="flex-1 accent-primary-500 h-1 bg-white/30 rounded-full appearance-none cursor-pointer"
                     />
                     <span className="text-xs text-white font-mono min-w-[3rem]">
-                      {formatTime(duration)}
+                      {formatTime(displayDuration)}
                     </span>
                   </div>
 
